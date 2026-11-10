@@ -31,7 +31,6 @@ python -m app                          # нужен ffmpeg в PATH
 
 ## Выпуск версии
 Релиз собирается автоматически (GitHub Actions, `.github/workflows/release.yml`):
-```
-git tag v1.0.1 && git push origin v1.0.1
-```
-Workflow соберёт Windows-установщик на Inno Setup и приложит его к релизу.
+Вариант 1: на GitHub открыть Actions → «Release installer» → Run workflow, указать версию (например `1.0.0`).
+Вариант 2: `git tag v1.0.1 && git push origin v1.0.1`.
+В обоих случаях workflow соберёт Windows-установщик на Inno Setup и создаст релиз `v<версия>` с приложенным `.exe`.

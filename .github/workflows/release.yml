@@ -4,6 +4,11 @@ on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      version:
+        description: "Версия релиза (без v), например 1.0.0"
+        required: true
+        default: "1.0.0"
 
 permissions:
   contents: write
@@ -18,7 +23,7 @@ jobs:
         id: ver
         shell: pwsh
         run: |
-          $v = if ($env:GITHUB_REF -like 'refs/tags/v*') { $env:GITHUB_REF_NAME.TrimStart('v') } else { '0.0.0-dev' }
+          $v = if ($env:GITHUB_REF -like 'refs/tags/v*') { $env:GITHUB_REF_NAME.TrimStart('v') } else { '${{ github.event.inputs.version }}' }
           "version=$v" >> $env:GITHUB_OUTPUT
 
       - name: Assemble build folder (embedded Python + app + ffmpeg)
@@ -81,8 +86,9 @@ jobs:
           path: Output/*.exe
 
       - name: Publish release
-        if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: v${{ steps.ver.outputs.version }}
+          target_commitish: ${{ github.sha }}
           files: Output/*.exe
           generate_release_notes: true
