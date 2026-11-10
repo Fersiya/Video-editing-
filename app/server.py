@@ -246,13 +246,24 @@ def pick_folder():
     try:
         if os.name == "nt":  # без tkinter: в встроенном Python его нет
             import subprocess
-            ps = ("[Console]::OutputEncoding=[Text.Encoding]::UTF8;"
-                  "Add-Type -AssemblyName System.Windows.Forms;"
-                  "$f=New-Object System.Windows.Forms.Form;$f.TopMost=$true;"
-                  "$d=New-Object System.Windows.Forms.FolderBrowserDialog;"
-                  "$d.Description='Папка с материалом';"
-                  "if($d.ShowDialog($f) -eq 'OK'){$d.SelectedPath}")
-            r = subprocess.run(["powershell", "-NoProfile", "-STA", "-Command", ps],
+            import base64
+            ps = r"""
+[Console]::OutputEncoding = [Text.Encoding]::UTF8
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -Name W -Namespace N -MemberDefinition '[DllImport("user32.dll")] public static extern void keybd_event(byte b, byte s, int f, int e); [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);'
+$f = New-Object System.Windows.Forms.Form
+$f.TopMost = $true; $f.ShowInTaskbar = $false; $f.Opacity = 0; $f.StartPosition = 'CenterScreen'
+$f.Size = New-Object System.Drawing.Size(1, 1)
+$f.Show()
+[N.W]::keybd_event(0x12, 0, 0, 0); [N.W]::keybd_event(0x12, 0, 2, 0)   # Alt: разрешает вывести окно на передний план
+[void][N.W]::SetForegroundWindow($f.Handle); $f.Activate()
+$d = New-Object System.Windows.Forms.FolderBrowserDialog
+$d.Description = 'Папка с материалом'
+if ($d.ShowDialog($f) -eq 'OK') { $d.SelectedPath }
+$f.Close()
+"""
+            enc = base64.b64encode(ps.encode("utf-16-le")).decode()
+            r = subprocess.run(["powershell", "-NoProfile", "-STA", "-EncodedCommand", enc],
                                capture_output=True, creationflags=0x08000000)
             return {"path": r.stdout.decode("utf-8", errors="ignore").strip()}
         import tkinter as tk
