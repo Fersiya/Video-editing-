@@ -12,6 +12,12 @@ PORT = 8765
 
 
 def _setup_env() -> None:
+    # консоль/редирект на Windows бывает в cp1252: без этого print с кириллицей падает
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
     # ffmpeg/ffprobe, которые кладёт установщик в <папка установки>\bin
     bindir = ROOT / "bin"
     if bindir.is_dir():
