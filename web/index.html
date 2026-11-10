@@ -1,0 +1,377 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Montage Sorter</title>
+<style>
+:root{
+  --bg:#0d0e13; --panel:#14161d; --card:#1a1d27; --line:#262a38; --text:#e8eaf2; --muted:#8a90a6;
+  --accent:#7c5cff; --accent2:#ff5c8a; --ok:#2ec4b6; --warn:#ffb020; --bad:#ff6b6b;
+}
+*{box-sizing:border-box}
+html,body{height:100%;margin:0}
+body{background:radial-gradient(1200px 700px at 30% 40%,#171a2b 0%,var(--bg) 60%);color:var(--text);
+  font:14px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;display:flex;flex-direction:column;overflow:hidden}
+header{display:flex;gap:10px;align-items:center;padding:12px 16px;border-bottom:1px solid var(--line);background:rgba(13,14,19,.7);backdrop-filter:blur(8px);z-index:3;flex-wrap:wrap}
+h1{font-size:15px;margin:0 8px 0 0;letter-spacing:.3px;font-weight:650}
+h1 span{color:var(--accent)}
+input[type=text]{flex:1;min-width:220px;background:var(--panel);border:1px solid var(--line);color:var(--text);padding:8px 10px;border-radius:8px;font:inherit}
+input[type=text]:focus{outline:none;border-color:var(--accent)}
+button{font:inherit;color:var(--text);background:var(--card);border:1px solid var(--line);padding:8px 14px;border-radius:8px;cursor:pointer;transition:.15s}
+button:hover:not(:disabled){border-color:var(--accent);background:#20243a}
+button:disabled{opacity:.4;cursor:default}
+button.primary{background:var(--accent);border-color:var(--accent);font-weight:600}
+button.primary:hover:not(:disabled){background:#8d72ff}
+label.opt{display:flex;gap:6px;align-items:center;color:var(--muted);cursor:pointer;user-select:none}
+label.opt input{accent-color:var(--accent)}
+main{flex:1;display:grid;grid-template-columns:minmax(300px,1fr) minmax(360px,46%);min-height:0}
+@media (max-width:820px){main{grid-template-columns:1fr;grid-template-rows:240px 1fr}}
+#stage{position:relative;min-height:0}
+#status{position:absolute;left:0;right:0;bottom:22px;text-align:center;pointer-events:none;padding:0 24px}
+#status .msg{font-size:15px}
+#status .sub{color:var(--muted);margin-top:4px;font-size:13px}
+#bar{height:3px;width:min(320px,70%);margin:10px auto 0;background:var(--line);border-radius:3px;overflow:hidden;opacity:0;transition:opacity .2s}
+#bar i{display:block;height:100%;width:0;background:linear-gradient(90deg,var(--accent),var(--accent2));transition:width .25s}
+aside{display:flex;flex-direction:column;min-height:0;border-left:1px solid var(--line);background:rgba(20,22,29,.55)}
+#tabs{display:flex;gap:6px;padding:10px 12px;border-bottom:1px solid var(--line);flex-wrap:wrap}
+#tabs button{padding:5px 11px;border-radius:999px;font-size:13px;color:var(--muted)}
+#tabs button.on{color:var(--text);border-color:var(--accent);background:#1f2240}
+#cards{flex:1;overflow:auto;padding:12px;display:grid;grid-template-columns:repeat(auto-fill,minmax(170px,1fr));gap:10px;align-content:start}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:10px;position:relative;transition:border-color .2s,opacity .2s,box-shadow .3s}
+.card.off{opacity:.4}
+.card.flash{border-color:var(--accent);box-shadow:0 0 0 3px rgba(124,92,255,.18)}
+.card .top{display:flex;justify-content:space-between;align-items:flex-start;gap:6px;cursor:pointer}
+.card .ttl{font-weight:600;font-size:13.5px;word-break:break-word}
+.card .par{color:var(--muted);font-size:11.5px}
+.card .cnt{font-variant-numeric:tabular-nums;font-size:22px;font-weight:650;margin:6px 0 2px}
+.card .meta{color:var(--muted);font-size:11.5px}
+.card .mv{font-size:11.5px;color:var(--warn)}
+.card .mv.zero{color:var(--muted)}
+.collage{display:grid;grid-template-columns:repeat(4,1fr);gap:3px;margin-top:8px;height:34px}
+.collage img,.collage div{width:100%;height:100%;object-fit:cover;border-radius:4px;background:#232738}
+.card input{accent-color:var(--accent);margin:2px 0 0}
+.files{display:none;margin-top:8px;max-height:170px;overflow:auto;font-size:12px;color:var(--muted);border-top:1px solid var(--line);padding-top:6px}
+.card.open .files{display:block}
+.files div{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;padding:1px 0}
+.files .d{color:var(--bad)}
+#empty{grid-column:1/-1;color:var(--muted);text-align:center;padding:50px 20px}
+footer{display:flex;gap:10px;align-items:center;padding:10px 14px;border-top:1px solid var(--line);background:rgba(13,14,19,.7)}
+footer .sum{flex:1;color:var(--muted)}
+footer .sum b{color:var(--text)}
+#toast{position:fixed;left:50%;bottom:78px;transform:translate(-50%,20px);background:#222640;border:1px solid var(--accent);padding:10px 16px;border-radius:10px;opacity:0;transition:.25s;z-index:10;pointer-events:none;max-width:80vw}
+#toast.show{opacity:1;transform:translate(-50%,0)}
+#fx{position:fixed;inset:0;pointer-events:none;z-index:2}
+</style>
+</head>
+<body>
+<header>
+  <h1>Montage <span>Sorter</span></h1>
+  <input type="text" id="path" placeholder="Папка с материалом, например D:\Монтаж\Хаос" spellcheck="false">
+  <button id="pick" title="Выбрать папку">Обзор…</button>
+  <label class="opt"><input type="checkbox" id="optContent" checked>По содержимому (ИИ)</label>
+  <label class="opt"><input type="checkbox" id="optRename" checked>Переименовать звуки</label>
+  <label class="opt"><input type="checkbox" id="optDups" checked>Дубликаты</label>
+  <button class="primary" id="scan">Сканировать</button>
+</header>
+
+<main>
+  <section id="stage">
+    <div id="status">
+      <div class="msg" id="msg">Выбери папку и нажми «Сканировать»</div>
+      <div class="sub" id="sub"></div>
+      <div id="bar"><i></i></div>
+    </div>
+  </section>
+  <aside>
+    <div id="tabs"></div>
+    <div id="cards"><div id="empty">Здесь появятся папки, куда уедут файлы.<br>Пока ничего не перемещается: сначала предпросмотр.</div></div>
+  </aside>
+</main>
+
+<footer>
+  <div class="sum" id="sum">—</div>
+  <button id="undo" disabled>Отменить последнюю сортировку</button>
+  <button class="primary" id="apply" disabled>Применить</button>
+</footer>
+
+<canvas id="fx"></canvas>
+<div id="toast"></div>
+
+<script>
+const $ = s => document.querySelector(s);
+const KIND_COLOR = {footage:'#7c5cff',music:'#ff5c8a',sfx:'#ffb020',image:'#2ec4b6',graphics:'#4da3ff',project:'#9aa0b4',other:'#6b7185',dup:'#ff6b6b'};
+const KIND_TITLE = {footage:'Видео',music:'Музыка',sfx:'SFX',image:'Картинки',graphics:'Графика',project:'Проекты',other:'Прочее',dup:'Дубликаты'};
+const TAB_OF = {footage:'video',image:'photo',graphics:'photo',music:'audio',sfx:'audio',project:'other',other:'other',dup:'other'};
+const TABS = [['all','Все'],['video','Видео'],['photo','Фото'],['audio','Аудио'],['other','Прочее']];
+const MAX_P = 400;
+
+let phase = 'idle', plan = null, tab = 'all', cardEls = new Map(), parts = [], launched = false, lastState = null;
+
+async function api(path, opts) {
+  const r = await fetch(path, {headers:{'Content-Type':'application/json'}, ...opts});
+  if (!r.ok) { const j = await r.json().catch(() => ({})); throw new Error(j.detail || r.statusText); }
+  return r.json();
+}
+function toast(t, ms = 3200) { const e = $('#toast'); e.textContent = t; e.classList.add('show'); clearTimeout(toast._t); toast._t = setTimeout(() => e.classList.remove('show'), ms); }
+function fmtSize(b) { const u = ['Б','КБ','МБ','ГБ','ТБ']; let i = 0; while (b >= 1024 && i < 4) { b /= 1024; i++; } return b.toFixed(b >= 10 || i === 0 ? 0 : 1) + ' ' + u[i]; }
+function pluralFiles(n) { const m = n % 100, d = n % 10; return (m > 10 && m < 20) ? 'файлов' : d === 1 ? 'файл' : (d >= 2 && d <= 4) ? 'файла' : 'файлов'; }
+
+/* ---------- вкладки ---------- */
+function renderTabs() {
+  $('#tabs').innerHTML = '';
+  for (const [k, t] of TABS) {
+    const b = document.createElement('button'); b.textContent = t; if (k === tab) b.className = 'on';
+    b.onclick = () => { tab = k; renderTabs(); applyTab(); };
+    $('#tabs').appendChild(b);
+  }
+}
+function applyTab() { for (const [, c] of cardEls) c.el.style.display = (tab === 'all' || TAB_OF[c.data.kind] === tab) ? '' : 'none'; }
+
+/* ---------- карточки ---------- */
+function clearCards() {
+  cardEls.clear(); plan = null; launched = false;
+  $('#cards').innerHTML = '<div id="empty">Здесь появятся папки, куда уедут файлы.<br>Пока ничего не перемещается: сначала предпросмотр.</div>';
+  $('#apply').disabled = true; updateSummary();
+}
+function buildCards() {
+  const box = $('#cards'); box.innerHTML = '';
+  const byDir = {};
+  for (const it of plan.items) (byDir[it.dir] ||= []).push(it);
+  for (const c of plan.cards) {
+    const parts_ = c.dir.split('/'), title = parts_.pop(), parent = parts_.join('/');
+    const el = document.createElement('div'); el.className = 'card';
+    const items = byDir[c.dir] || [];
+    const th = items.filter(i => i.thumb).slice(0, 4);
+    el.innerHTML = `
+      <div class="top"><div><div class="ttl"></div><div class="par"></div></div><input type="checkbox" checked title="Переместить эту папку"></div>
+      <div class="cnt">0</div>
+      <div class="meta">${KIND_TITLE[c.kind]} · ${fmtSize(c.size)}</div>
+      <div class="mv ${c.moves ? '' : 'zero'}">${c.moves ? 'переедет: ' + c.moves : 'уже на месте'}</div>
+      <div class="collage">${th.map(i => `<img loading="lazy" src="/api/thumb/${i.id}">`).join('') + '<div></div>'.repeat(Math.max(0, 4 - th.length))}</div>
+      <div class="files"></div>`;
+    const RU = {Footage:'Видео', Music:'Музыка', SFX:'SFX', Images:'Картинки', Graphics:'Графика', Project:'Проекты', Other:'Прочее', Duplicates:'Дубликаты', Audio:'Аудио'};
+    const ru = s => { s = s.replace(/^\d+_/, ''); return RU[s] || s; };
+    el.querySelector('.ttl').textContent = ru(title);
+    el.querySelector('.par').textContent = parent ? parent.split('/').map(ru).join(' / ') : ' ';
+    const files = el.querySelector('.files');
+    for (const i of items.slice(0, 60)) { const d = document.createElement('div'); d.textContent = i.name + (i.new_name ? '  →  ' + i.new_name : '') + (i.bpm ? '  (~' + i.bpm + ' bpm)' : '') + (i.dup_of ? '  ⟵ копия ' + i.dup_of : ''); if (i.dup_of) d.className = 'd'; files.appendChild(d); }
+    if (items.length > 60) { const d = document.createElement('div'); d.textContent = `… и ещё ${items.length - 60}`; files.appendChild(d); }
+    const cb = el.querySelector('input');
+    cb.onchange = () => { c.on = cb.checked; el.classList.toggle('off', !cb.checked); updateSummary(); };
+    el.querySelector('.top').onclick = e => { if (e.target !== cb) el.classList.toggle('open'); };
+    c.on = true;
+    box.appendChild(el);
+    cardEls.set(c.dir, {el, data: c, cnt: el.querySelector('.cnt'), arrived: 0, total: 0});
+  }
+  applyTab();
+}
+function setCount(rec, v) { rec.cnt.textContent = v; }
+function updateSummary() {
+  if (!plan) { $('#sum').textContent = '—'; return; }
+  let mv = 0, all = plan.items.length;
+  for (const c of plan.cards) if (c.on !== false) mv += c.moves;
+  $('#sum').innerHTML = `Найдено <b>${all}</b> ${pluralFiles(all)} · переедет <b>${mv}</b>`;
+  $('#apply').disabled = mv === 0 || phase !== 'ready';
+}
+
+/* ---------- частицы ---------- */
+const cv = $('#fx'), ctx = cv.getContext('2d');
+let W = 0, H = 0, DPR = 1;
+function resize() { DPR = Math.min(2, window.devicePixelRatio || 1); W = innerWidth; H = innerHeight; cv.width = W * DPR; cv.height = H * DPR; cv.style.width = W + 'px'; cv.style.height = H + 'px'; ctx.setTransform(DPR, 0, 0, DPR, 0, 0); }
+addEventListener('resize', resize); resize();
+
+function mkParticle(i, n) {
+  const y = 1 - 2 * (i + .5) / n, r = Math.sqrt(1 - y * y), phi = i * 2.399963;
+  return {bx: Math.cos(phi) * r, by: y, bz: Math.sin(phi) * r, kind: ['footage','image','music','sfx','graphics','image','footage'][i % 7], item: null,
+    img: null, state: 'sphere', px: 0, py: 0, ps: 12, a: 1, size: 14 + Math.random() * 10, delay: 0};
+}
+function ensureParticles(n) {
+  n = Math.max(40, Math.min(MAX_P, n));
+  if (parts.length === n) return;
+  parts = Array.from({length: n}, (_, i) => mkParticle(i, n));
+}
+ensureParticles(160);
+
+function stageRect() { const r = $('#stage').getBoundingClientRect(); return r; }
+let rot = 0, last = performance.now(), speed = 0.35;
+
+function project(p, R, cx, cy, tilt) {
+  const c = Math.cos(rot), s = Math.sin(rot);
+  let x = p.bx * c + p.bz * s, z = -p.bx * s + p.bz * c, y = p.by;
+  const ct = Math.cos(tilt), st = Math.sin(tilt);
+  const y2 = y * ct - z * st, z2 = y * st + z * ct;
+  const k = 1 / (1 - z2 * 0.32);
+  return {x: cx + x * R * k, y: cy + y2 * R * k, z: z2, k};
+}
+function drawTile(p, x, y, sz, a) {
+  ctx.globalAlpha = a;
+  const r = sz * 0.2;
+  ctx.save(); ctx.translate(x, y); ctx.rotate(p.rotz || 0);
+  ctx.beginPath(); ctx.roundRect(-sz / 2, -sz / 2, sz, sz, r); ctx.clip();
+  if (p.img && p.img.complete && p.img.naturalWidth) {
+    const iw = p.img.naturalWidth, ih = p.img.naturalHeight, m = Math.min(iw, ih);
+    ctx.drawImage(p.img, (iw - m) / 2, (ih - m) / 2, m, m, -sz / 2, -sz / 2, sz, sz);
+  } else {
+    ctx.fillStyle = KIND_COLOR[p.kind] || '#888'; ctx.fillRect(-sz / 2, -sz / 2, sz, sz);
+    ctx.fillStyle = 'rgba(255,255,255,.18)'; ctx.fillRect(-sz / 2, -sz / 2, sz, sz * 0.45);
+  }
+  ctx.restore();
+  ctx.globalAlpha = a * 0.5; ctx.strokeStyle = 'rgba(255,255,255,.35)'; ctx.lineWidth = 0.6;
+  ctx.beginPath(); ctx.roundRect(x - sz / 2, y - sz / 2, sz, sz, r); ctx.stroke();
+  ctx.globalAlpha = 1;
+}
+const ease = t => t < .5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
+
+function frame(now) {
+  const dt = Math.min(0.05, (now - last) / 1000); last = now;
+  ctx.clearRect(0, 0, W, H);
+  const sr = stageRect(), cx = sr.left + sr.width / 2, cy = sr.top + sr.height * 0.44;
+  const R = Math.min(sr.width, sr.height) * 0.34;
+  const scanning = phase === 'scanning';
+  rot += dt * (scanning ? 1.6 : speed);
+  const pulse = scanning ? 1 + 0.035 * Math.sin(now / 160) : 1;
+
+  const flying = [], sphere = [];
+  for (const p of parts) {
+    if (p.state === 'sphere') { const q = project(p, R * pulse, cx, cy, 0.38); p.px = q.x; p.py = q.y; p.ps = p.size * q.k * (0.6 + 0.4 * (q.z + 1) / 2); p.z = q.z; sphere.push(p); }
+    else if (p.state === 'fly') flying.push(p);
+  }
+  sphere.sort((a, b) => a.z - b.z);
+  for (const p of sphere) { p.rotz = (p.rotz || 0); drawTile(p, p.px, p.py, p.ps, 0.45 + 0.55 * (p.z + 1) / 2); }
+
+  for (const p of parts) {
+    if (p.state === 'launching') {
+      if (now >= p.t0) { p.state = 'fly'; }
+      else { const q = project(p, R, cx, cy, 0.38); p.px = q.x; p.py = q.y; p.ps = p.size * q.k * (0.6 + 0.4 * (q.z + 1) / 2); drawTile(p, p.px, p.py, p.ps, .9); continue; }
+    }
+    if (p.state === 'fly') {
+      let t = (now - p.t0) / p.dur;
+      if (t >= 1) { p.state = 'done'; arrive(p); continue; }
+      const e = ease(Math.max(0, t));
+      const x = (1 - e) * (1 - e) * p.fx + 2 * (1 - e) * e * p.cx_ + e * e * p.tx;
+      const y = (1 - e) * (1 - e) * p.fy + 2 * (1 - e) * e * p.cy_ + e * e * p.ty;
+      const sz = p.fs + (14 - p.fs) * e;
+      p.rotz = (p.rotz || 0) + dt * 3 * (1 - e);
+      drawTile(p, x, y, Math.max(8, sz), 1 - Math.pow(e, 6) * 0.9);
+    } else if (p.state === 'dissolve') {
+      p.a -= dt * 2.2; if (p.a <= 0) { p.state = 'done'; continue; }
+      drawTile(p, p.px, p.py + (1 - p.a) * 30, p.ps * (0.5 + p.a / 2), p.a);
+    }
+  }
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+function arrive(p) {
+  const rec = cardEls.get(p.dir); if (!rec) return;
+  rec.arrived++;
+  const frac = rec.arrived / rec.total;
+  setCount(rec, Math.round(rec.data.count * frac));
+  rec.el.classList.add('flash'); clearTimeout(rec.ft); rec.ft = setTimeout(() => rec.el.classList.remove('flash'), 180);
+  if (rec.arrived >= rec.total) setCount(rec, rec.data.count);
+}
+
+function launchSort() {
+  launched = true;
+  // повторно проверим готовность разметки
+  const items = plan.items.slice();
+  for (let i = items.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [items[i], items[j]] = [items[j], items[i]]; }
+  const sr = stageRect(), cx = sr.left + sr.width / 2, cy = sr.top + sr.height * 0.44, R = Math.min(sr.width, sr.height) * 0.34;
+  const panel = $('#cards').getBoundingClientRect();
+  const M = Math.min(parts.length, items.length);
+  const now = performance.now();
+  for (const [, rec] of cardEls) { rec.arrived = 0; rec.total = 0; }
+  // сначала миниатюры: частицы с реальными превью
+  let withImg = 0;
+  parts.forEach((p, i) => {
+    if (i >= M) { p.state = 'dissolve'; p.a = 1; return; }
+    const it = items[i], rec = cardEls.get(it.dir);
+    p.item = it; p.kind = it.kind; p.dir = it.dir;
+    if (it.thumb && withImg < 140) { withImg++; const im = new Image(); im.src = '/api/thumb/' + it.id; p.img = im; }
+    const q = project(p, R, cx, cy, 0.38);
+    const cr = rec.el.getBoundingClientRect();
+    let tx = cr.left + cr.width / 2, ty = cr.top + 36;
+    ty = Math.max(panel.top + 10, Math.min(panel.bottom - 10, ty));
+    tx = Math.max(panel.left + 10, Math.min(panel.right - 10, tx));
+    Object.assign(p, {state: 'launching', fx: q.x, fy: q.y, fs: p.size * q.k, tx, ty,
+      t0: now + 250 + Math.random() * 1500, dur: 900 + Math.random() * 500});
+    const mx = (q.x + tx) / 2, my = (q.y + ty) / 2, nx = -(ty - q.y), ny = (tx - q.x), L = Math.hypot(nx, ny) || 1;
+    const off = (Math.random() - .5) * 220;
+    p.cx_ = mx + nx / L * off; p.cy_ = my + ny / L * off - 60;
+    rec.total++;
+  });
+  for (const [, rec] of cardEls) if (rec.total === 0) setCount(rec, rec.data.count);
+  speed = 0.9;
+}
+
+/* ---------- логика ---------- */
+function setPhase(p) { phase = p; $('#scan').disabled = (p === 'scanning' || p === 'applying'); updateSummary(); }
+function setStatus(msg, sub = '', prog = null) {
+  $('#msg').textContent = msg; $('#sub').textContent = sub;
+  const bar = $('#bar'); bar.style.opacity = prog === null ? 0 : 1; if (prog !== null) bar.firstElementChild.style.width = Math.round(prog * 100) + '%';
+}
+
+async function poll() {
+  let s;
+  try { s = await api('/api/state'); } catch (e) { setTimeout(poll, 1000); return; }
+  lastState = s; $('#undo').disabled = !s.can_undo || s.phase === 'scanning';
+  if (s.phase === 'scanning') {
+    ensureParticles(s.found || 160);
+    const prog = s.found ? Math.min(1, s.done / s.found) : null;
+    setStatus(s.message, s.found ? `${s.done} / ${s.found}` : '', prog);
+    setTimeout(poll, 350);
+  } else if (s.phase === 'ready') {
+    plan = await api('/api/plan');
+    setPhase('ready'); buildCards(); updateSummary(); renderTabs();
+    let sub = `Папка: ${plan.dest}`;
+    if (s.clip === false || s.audio_ai === false) sub = 'ИИ недоступен (' + (s.clip_error || s.audio_error || 'нет модели') + ') — часть файлов разложена только по типам';
+    setStatus(plan.items.length ? 'Файлы разложены. Проверь предпросмотр' : 'В папке нет файлов', sub);
+    requestAnimationFrame(() => requestAnimationFrame(launchSort));
+  } else if (s.phase === 'error') {
+    setPhase('idle'); setStatus('Ошибка', s.error || '');
+  }
+}
+
+$('#scan').onclick = async () => {
+  const path = $('#path').value.trim();
+  if (!path) return toast('Укажи папку');
+  clearCards();
+  try { await api('/api/scan', {method: 'POST', body: JSON.stringify({path, content: $('#optContent').checked, dups: $('#optDups').checked, rename: $('#optRename').checked})}); }
+  catch (e) { return toast(e.message); }
+  localStorage.setItem?.('ms_path', path);
+  setPhase('scanning'); ensureParticles(160); speed = 0.35; setStatus('Сканирую…', '', 0); poll();
+};
+$('#pick').onclick = async () => {
+  try { const r = await api('/api/pick', {method: 'POST'}); if (r.path) $('#path').value = r.path; }
+  catch (e) { toast(e.message + '. Вставь путь вручную'); }
+};
+$('#apply').onclick = async () => {
+  if (!plan) return;
+  const exclude = plan.cards.filter(c => c.on === false).map(c => c.dir);
+  setPhase('applying'); $('#apply').disabled = true;
+  try {
+    const r = await api('/api/apply', {method: 'POST', body: JSON.stringify({exclude})});
+    toast(`Перемещено: ${r.moved}` + (r.errors.length ? `, ошибок: ${r.errors.length}` : ''));
+    setStatus(`Готово: перемещено ${r.moved} ${pluralFiles(r.moved)}`, 'Можно отменить кнопкой справа внизу');
+    clearCards(); setPhase('idle');
+    ensureParticles(160); parts.length = 0; ensureParticles(120);
+  } catch (e) { toast(e.message); setPhase('ready'); }
+  poll2();
+};
+$('#undo').onclick = async () => {
+  try { const r = await api('/api/undo', {method: 'POST'}); toast(`Возвращено файлов: ${r.restored}`); setStatus('Сортировка отменена', ''); clearCards(); }
+  catch (e) { toast(e.message); }
+  poll2();
+};
+async function poll2() { try { const s = await api('/api/state'); $('#undo').disabled = !s.can_undo; } catch {} }
+
+$('#path').addEventListener('keydown', e => { if (e.key === 'Enter') $('#scan').click(); });
+try { const p = localStorage.getItem('ms_path'); if (p) $('#path').value = p; } catch {}
+renderTabs(); poll2();
+const ping = () => fetch('/api/ping', {method: 'POST'}).catch(() => {});
+ping(); setInterval(ping, 4000);
+addEventListener('pagehide', () => navigator.sendBeacon('/api/bye'));
+</script>
+</body>
+</html>
