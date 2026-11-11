@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import tempfile
 import threading
@@ -51,6 +52,7 @@ class ScanReq(BaseModel):
     rename: bool = False  # переименовывать звуки по тегам (нужен ИИ)
     split_video: bool = True  # вертикальные и slow-mo видео в отдельные подпапки
     help_sens: float = 1.0  # строгость ИИ: больше — чаще просит помощи (0.5–1.5)
+    rename_media: bool = False  # видео и фото: ДАТА_КАЧЕСТВО_имя
 
 
 class ApplyReq(BaseModel):
@@ -209,6 +211,67 @@ def _flag_review(items: list[dict], sens: float) -> None:
             it["review"] = True
 
 
+# Файлы-«спутники» камер и редакторов: едут в ту же папку, что и основной файл
+SIDECAR_EXT = {".xmp", ".xml", ".srt", ".thm", ".nfo", ".lrv", ".lrf", ".aae", ".ass", ".vtt", ".cue", ".pp3",
+               ".dop", ".on1", ".bim", ".cpi", ".mpl", ".sidecar", ".ltd"}
+_SONY_SUFFIX = re.compile(r"m\d+$", re.I)  # C0001M01.XML рядом с C0001.MP4
+_MAIN_PRIORITY = {"footage": 0, "image": 1, "dup": 2, "sfx": 3, "music": 3, "graphics": 4}
+
+
+def _attach_sidecars(items: list[dict]) -> None:
+    mains: dict[tuple[str, str], list[dict]] = defaultdict(list)
+    for it in items:
+        if it["kind"] in _MAIN_PRIORITY:
+            p = Path(it["src"])
+            mains[(os.path.normcase(str(p.parent)), p.stem.lower())].append(it)
+    for it in items:
+        p = Path(it["src"])
+        ext = p.suffix.lower()
+        if it["kind"] != "other" or ext not in SIDECAR_EXT:
+            continue
+        key_dir, stem = os.path.normcase(str(p.parent)), p.stem.lower()
+        cands = mains.get((key_dir, stem))
+        if not cands and ext == ".xml":
+            m = _SONY_SUFFIX.search(stem)
+            if m:
+                cands = mains.get((key_dir, stem[:m.start()]))
+        if not cands:
+            continue
+        main = min(cands, key=lambda c: _MAIN_PRIORITY[c["kind"]])
+        main_stem_len = len(Path(main["name"]).stem)
+        it["kind"] = "sidecar"
+        it["sidecar_of"] = main["id"]
+        it["sc_suffix"] = it["name"][main_stem_len:] if it["name"][:main_stem_len].lower() == Path(main["name"]).stem.lower() \
+            else p.suffix
+
+
+def _eff(it: dict, items: list[dict]) -> tuple[str, str]:
+    """(папка назначения, имя файла) с учётом того, что спутник следует за основным файлом."""
+    if it["kind"] == "sidecar":
+        m = items[it["sidecar_of"]]
+        return m["target_dir"], Path(m.get("new_name") or m["name"]).stem + it["sc_suffix"]
+    return it["target_dir"], it.get("new_name") or it["name"]
+
+
+def _rename_media(items: list[dict]) -> None:
+    """Видео: 2026-11-10_4K30_C0001.mp4 (V — вертикальное); фото: 2026-11-10_IMG_0001.jpg."""
+    def job(it):
+        if it["kind"] not in ("footage", "image") or C.DATE_PREFIX.match(it["name"]):
+            return
+        src = Path(C.lp(it["src"]))
+        if it["kind"] == "image":
+            it["new_name"] = f"{C.file_date(src)}_{it['name']}"
+            return
+        info = it.get("vinfo") or {}
+        date = info.get("date") or C.file_date(src)
+        tag = ""
+        if info:
+            tag = f"{C.res_label(info['w'], info['h'])}{int(round(info['fps']))}" + ("V" if info["h"] > info["w"] * 1.05 else "")
+        it["new_name"] = f"{date}_{tag + '_' if tag else ''}{it['name']}"
+    with ThreadPoolExecutor(max_workers=min(8, (os.cpu_count() or 4))) as ex:
+        list(ex.map(job, items))
+
+
 def _scan(req: ScanReq) -> None:
     try:
         root = Path(req.path).expanduser().resolve()
@@ -238,14 +301,16 @@ def _scan(req: ScanReq) -> None:
                 if i % 25 == 0:
                     _set(done=i)
 
-        # 1b) вертикальные / slow-mo
-        if req.split_video:
+        _attach_sidecars(items)
+
+        # 1b) вертикальные / slow-mo, параметры для имён
+        if req.split_video or req.rename_media:
             vids = [it for it in items if it["kind"] == "footage"]
             if vids:
                 _set(message="Читаю параметры видео…", done=0, found=len(vids))
                 with ThreadPoolExecutor(max_workers=min(8, (os.cpu_count() or 4))) as ex:
                     for it, info in zip(vids, ex.map(lambda x: C.video_info(Path(C.lp(x["src"]))), vids)):
-                        it["vgroup"] = C.video_group(info)
+                        it["vgroup"] = C.video_group(info) if req.split_video else ""
                         it["vinfo"] = info
 
         # 2) дубликаты (одинаковый размер → полный хэш)
@@ -253,7 +318,7 @@ def _scan(req: ScanReq) -> None:
             _set(message="Ищу дубликаты…", done=0)
             by_size: dict[int, list[dict]] = defaultdict(list)
             for it in items:
-                if it["size"] > 0:
+                if it["size"] > 0 and it["kind"] != "sidecar":
                     by_size[it["size"]].append(it)
             for group in by_size.values():
                 if len(group) < 2:
@@ -330,8 +395,12 @@ def _scan(req: ScanReq) -> None:
             _analyze_audio(items, req.rename)
             _flag_review(items, max(0.3, min(2.0, req.help_sens)))
 
+        if req.rename_media:
+            _set(message="Придумываю имена…")
+            _rename_media([it for it in items if it["kind"] != "dup"])
         for it in items:
-            it["target_dir"] = _target_dir(it)
+            if it["kind"] != "sidecar":
+                it["target_dir"] = _target_dir(it)
         _set(items=items, phase="ready", message=f"Готово: {len(items)} файлов")
     except Exception as e:  # noqa: BLE001
         _set(phase="error", error=f"{e.__class__.__name__}: {e}")
@@ -448,17 +517,18 @@ def plan():
     cards: dict[str, dict] = {}
     out = []
     for it in items:
-        td = it["target_dir"]
+        td, nm = _eff(it, items)
         cur = str(Path(it["rel"]).parent).replace("\\", "/")
         cur = "" if cur == "." else cur
-        moves = cur != td or bool(it.get("new_name") and it["new_name"] != it["name"])
-        c = cards.setdefault(td, {"dir": td, "kind": it["kind"], "count": 0, "moves": 0, "size": 0})
+        moves = cur != td or nm != it["name"]
+        ckind = items[it["sidecar_of"]]["kind"] if it["kind"] == "sidecar" else it["kind"]
+        c = cards.setdefault(td, {"dir": td, "kind": ckind, "count": 0, "moves": 0, "size": 0})
         c["count"] += 1
         c["moves"] += 1 if moves else 0
         c["size"] += it["size"]
         out.append({"id": it["id"], "name": it["name"], "rel": it["rel"], "kind": it["kind"],
                     "topic": it.get("topic"), "dir": td, "thumb": bool(it.get("thumb")),
-                    "dup_of": it["dup_of"], "new_name": it.get("new_name"), "bpm": it.get("bpm"),
+                    "dup_of": it["dup_of"], "new_name": nm if nm != it["name"] else None, "bpm": it.get("bpm"),
                     "review": bool(it.get("review")), "learned": bool(it.get("learned"))})
     return {"dest": dest, "cards": sorted(cards.values(), key=lambda c: c["dir"]), "items": out,
             "review_count": sum(1 for i in out if i["review"]), "memory": M.count()}
@@ -479,6 +549,8 @@ def thumb(item_id: int):
 def _choices(it: dict) -> list[str]:
     """Папки, куда можно вручную перенести этот файл."""
     kind = it["kind"]
+    if kind not in C.DIRS:
+        return []
     base = C.DIRS[kind]
     if kind == "footage" and it.get("vgroup"):
         base = f"{base}/{it['vgroup']}"
@@ -655,7 +727,7 @@ def apply(req: ApplyReq):
         dest = Path(STATE["dest"])
         if copy:  # хватит ли места под копии
             need = sum(it["size"] for it in items
-                       if it["target_dir"] not in req.exclude and it["kind"] != "dup")
+                       if _eff(it, items)[0] not in req.exclude and not _eff(it, items)[0].startswith(C.DIRS["dup"]))
             free = shutil.disk_usage(dest).free
             if need * 1.02 + 500 * 2**20 > free:
                 raise HTTPException(400, f"Не хватает места для копий: нужно {need / 2**30:.1f} ГБ, свободно {free / 2**30:.1f} ГБ")
@@ -667,12 +739,13 @@ def apply(req: ApplyReq):
                 continue
             os.makedirs(C.lp(dest / d), exist_ok=True)
         for it in items:
-            if it["target_dir"] in req.exclude:
+            tdir, tname = _eff(it, items)
+            if tdir in req.exclude:
                 continue
-            if copy and it["kind"] == "dup":
+            if copy and tdir.startswith(C.DIRS["dup"]):
                 continue  # копии копий не плодим
             src = Path(it["src"])
-            dst = dest / it["target_dir"] / (it.get("new_name") or it["name"])
+            dst = dest / tdir / tname
             if os.path.normcase(os.path.abspath(src)) == os.path.normcase(os.path.abspath(dst)) \
                     or not os.path.exists(C.lp(src)):
                 continue

@@ -99,6 +99,7 @@ footer .sum b{color:var(--text)}
   <label class="opt"><input type="checkbox" id="optRename" checked>Переименовать звуки</label>
   <label class="opt"><input type="checkbox" id="optSplit" checked title="Вертикальные (9:16) и slow-mo (60+ fps) видео в отдельные подпапки">Вертикальные/slow-mo отдельно</label>
   <label class="opt" title="Чем правее, тем чаще программа будет просить помощи, когда не уверена"><span>Строгость ИИ</span><input type="range" id="sens" min="50" max="150" value="100" style="width:80px"></label>
+  <label class="opt" title="Видео: 2026-11-10_4K30_C0001.mp4 (V — вертикальное), фото: дата_имя. Исходные имена в проектах монтажа могут сломаться"><input type="checkbox" id="optRenameMedia">Имена видео/фото: дата_качество</label>
   <label class="opt"><input type="checkbox" id="optDups" checked>Дубликаты</label>
   <button class="primary" id="scan">Сканировать</button>
 </header>
@@ -140,7 +141,7 @@ footer .sum b{color:var(--text)}
 
 <script>
 const $ = s => document.querySelector(s);
-const KIND_COLOR = {footage:'#7c5cff',music:'#ff5c8a',sfx:'#ffb020',image:'#2ec4b6',graphics:'#4da3ff',project:'#9aa0b4',other:'#6b7185',dup:'#ff6b6b'};
+const KIND_COLOR = {sidecar:'#6b7185',footage:'#7c5cff',music:'#ff5c8a',sfx:'#ffb020',image:'#2ec4b6',graphics:'#4da3ff',project:'#9aa0b4',other:'#6b7185',dup:'#ff6b6b'};
 const KIND_TITLE = {footage:'Видео',music:'Музыка',sfx:'SFX',image:'Картинки',graphics:'Графика',project:'Проекты',other:'Прочее',dup:'Дубликаты'};
 const TAB_OF = {footage:'video',image:'photo',graphics:'photo',music:'audio',sfx:'audio',project:'other',other:'other',dup:'other'};
 const TABS = [['all','Все'],['video','Видео'],['photo','Фото'],['audio','Аудио'],['other','Прочее']];
@@ -204,7 +205,7 @@ function buildCards(keep) {
     el.querySelector('.ttl').textContent = ru(title);
     el.querySelector('.par').textContent = parent ? dirLabel(parent) : ' ';
     const files = el.querySelector('.files');
-    for (const i of items.slice(0, 60)) { const d = document.createElement('div'); d.textContent = i.name + (i.new_name ? '  →  ' + i.new_name : '') + (i.bpm ? '  (~' + i.bpm + ' bpm)' : '') + (i.dup_of ? '  ⟵ копия ' + i.dup_of : '') + (i.learned ? '  ★' : '') + (i.review ? '  ?' : ''); if (i.dup_of) d.className = 'd'; if (EDITABLE.has(i.kind)) { d.classList.add('ed'); d.title = 'Нажми, чтобы перенести в другую папку'; d.onclick = e => openMenu(e, i); } files.appendChild(d); }
+    for (const i of items.slice(0, 60)) { const d = document.createElement('div'); d.textContent = (i.kind === 'sidecar' ? '↳ ' : '') + i.name + (i.new_name ? '  →  ' + i.new_name : '') + (i.bpm ? '  (~' + i.bpm + ' bpm)' : '') + (i.dup_of ? '  ⟵ копия ' + i.dup_of : '') + (i.learned ? '  ★' : '') + (i.review ? '  ?' : ''); if (i.dup_of) d.className = 'd'; if (EDITABLE.has(i.kind)) { d.classList.add('ed'); d.title = 'Нажми, чтобы перенести в другую папку'; d.onclick = e => openMenu(e, i); } files.appendChild(d); }
     if (items.length > 60) { const d = document.createElement('div'); d.textContent = `… и ещё ${items.length - 60}`; files.appendChild(d); }
     const cb = el.querySelector('input');
     cb.onchange = () => { c.on = cb.checked; el.classList.toggle('off', !cb.checked); updateSummary(); };
@@ -420,7 +421,7 @@ $('#scan').onclick = async () => {
   const path = $('#path').value.trim();
   if (!path) return toast('Укажи папку');
   clearCards();
-  try { await api('/api/scan', {method: 'POST', body: JSON.stringify({path, content: $('#optContent').checked, dups: $('#optDups').checked, rename: $('#optRename').checked, split_video: $('#optSplit').checked, help_sens: $('#sens').value / 100})}); }
+  try { await api('/api/scan', {method: 'POST', body: JSON.stringify({path, content: $('#optContent').checked, dups: $('#optDups').checked, rename: $('#optRename').checked, split_video: $('#optSplit').checked, help_sens: $('#sens').value / 100, rename_media: $('#optRenameMedia').checked})}); }
   catch (e) { return toast(e.message); }
   localStorage.setItem?.('ms_path', path);
   setPhase('scanning'); ensureParticles(160); speed = 0.35; setStatus('Сканирую…', '', 0); poll();

@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -162,10 +163,13 @@ def video_info(path: Path) -> dict | None:
         return None
     try:
         r = _run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
-                  "stream=width,height,r_frame_rate,avg_frame_rate:stream_tags=rotate:stream_side_data=rotation",
+                  "stream=width,height,r_frame_rate,avg_frame_rate:stream_tags=rotate,creation_time:stream_side_data=rotation:format_tags=creation_time",
                   "-of", "json", lp(path)])
-        st = json.loads(r.stdout)["streams"][0]
+        data = json.loads(r.stdout)
+        st = data["streams"][0]
         w, h = int(st["width"]), int(st["height"])
+        ct = ((data.get("format") or {}).get("tags") or {}).get("creation_time") or (st.get("tags") or {}).get("creation_time") or ""
+        date = ct[:10] if re.fullmatch(r"\d{4}-\d{2}-\d{2}", ct[:10]) and not ct.startswith("1970") else None
         rot = 0
         try:
             rot = int(float((st.get("tags") or {}).get("rotate", 0)))
@@ -182,9 +186,32 @@ def video_info(path: Path) -> dict | None:
             return float(a) / float(b) if float(b or 1) else 0.0
 
         fps = fr(st.get("avg_frame_rate", "0/1")) or fr(st.get("r_frame_rate", "0/1"))
-        return {"w": w, "h": h, "fps": round(fps, 2)}
+        return {"w": w, "h": h, "fps": round(fps, 2), "date": date}
     except Exception:
         return None
+
+
+def res_label(w: int, h: int) -> str:
+    m = max(w, h)
+    return "8K" if m >= 7600 else "4K" if m >= 3600 else "2.7K" if m >= 2500 else "1080p" if m >= 1900 \
+        else "720p" if m >= 1260 else "SD"
+
+
+def file_date(path: Path) -> str:
+    """Дата съёмки фото: EXIF DateTimeOriginal, иначе дата изменения файла."""
+    import time
+    try:
+        with Image.open(lp(path)) as im:
+            ex = im.getexif()
+            raw = ex.get_ifd(0x8769).get(0x9003) or ex.get(0x0132)
+            if raw and re.match(r"\d{4}:\d{2}:\d{2}", str(raw)):
+                return str(raw)[:10].replace(":", "-")
+    except Exception:
+        pass
+    return time.strftime("%Y-%m-%d", time.localtime(os.path.getmtime(lp(path))))
+
+
+DATE_PREFIX = re.compile(r"^\d{4}-\d{2}-\d{2}_")
 
 
 def video_group(info: dict | None) -> str:
