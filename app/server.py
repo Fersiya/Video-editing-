@@ -47,21 +47,23 @@ class ScanReq(BaseModel):
     content: bool = True
     dups: bool = True
     rename: bool = False  # переименовывать звуки по тегам (нужен ИИ)
+    split_video: bool = True  # вертикальные и slow-mo видео в отдельные подпапки
 
 
 class ApplyReq(BaseModel):
     exclude: list[str] = []  # папки (target_dir), которые не трогаем
+    mode: str = "move"  # move | copy
 
 
 # ---------------- Сканирование ----------------
 
 def _walk(root: Path):
-    for dirpath, dirnames, filenames in os.walk(root):
+    for dirpath, dirnames, filenames in os.walk(C.lp(root, True)):
         dirnames[:] = [d for d in dirnames if not d.startswith(".") and d != "__pycache__"]
         for fn in filenames:
             if fn.startswith(".") or fn.lower() in ("thumbs.db", "desktop.ini"):
                 continue
-            yield Path(dirpath) / fn
+            yield Path(C.unlp(dirpath)) / fn
 
 
 def _set(**kw):
@@ -73,6 +75,8 @@ def _target_dir(item: dict) -> str:
     kind = item["kind"]
     base = C.DIRS[kind]
     topic = item.get("topic")
+    if kind == "footage" and item.get("vgroup"):
+        base = f"{base}/{item['vgroup']}"
     if kind in ("image", "footage", "sfx", "music") and topic:
         return f"{base}/{topic}"
     return base
@@ -116,17 +120,24 @@ def _analyze_audio(items: list[dict], rename: bool) -> None:
         return
     _set(message=f"ИИ слушает звуки ({AUDIO.device})…")
     ok = [(it, a) for it, (a, _) in zip(targets, loaded) if a is not None]
-    for kind, fn in (("sfx", AUDIO.sfx), ("music", AUDIO.music)):
-        group = [(it, a) for it, a in ok if it["kind"] == kind]
-        if not group:
-            continue
-        res = fn([a for _, a in group])
-        for (it, _), (cat, tag, conf) in zip(group, res):
+    if ok:
+        res = AUDIO.joint([a for _, a in ok])
+        for (it, _), r in zip(ok, res):
+            if it["kind"] == "music" and r["p_amb"] >= 0.35 and r["p_amb"] > r["p_music"]:
+                it["kind"] = "sfx"  # длинный амбиент — это SFX, а не музыка
+                cat, tag = r["amb"]
+                conf = r["p_amb"]
+            elif it["kind"] == "sfx" and r["p_music"] >= 0.6:
+                it["kind"] = "music"  # короткий джингл/отбивка — музыка
+                cat, tag, conf = r["mood"]
+            elif it["kind"] == "sfx":
+                cat, tag, conf = r["sfx"]
+            else:
+                cat, tag, conf = r["mood"]
             it["topic"] = cat if tag else None
             it["tag"] = tag
             it["conf"] = round(conf, 2)
-        _set(done=len(ok))
-    _set(audio_ai=True)
+    _set(done=len(ok), audio_ai=True)
 
     if rename:
         counters: dict[str, int] = defaultdict(int)
@@ -150,10 +161,11 @@ def _scan(req: ScanReq) -> None:
              root=str(root), dest=str(root), clip=None, clip_error=None,
              audio_ai=None, audio_error=None, error=None)
 
+        shutil.rmtree(CACHE_DIR, ignore_errors=True)
         items: list[dict] = []
         for p in _walk(root):
             try:
-                size = p.stat().st_size
+                size = os.stat(C.lp(p)).st_size
             except OSError:
                 continue
             items.append({"id": len(items), "src": str(p), "name": p.name,
@@ -165,9 +177,19 @@ def _scan(req: ScanReq) -> None:
 
         # 1) тип
         for i, it in enumerate(items):
-            it["kind"] = C.classify_kind(Path(it["src"]))
+            it["kind"] = C.classify_kind(Path(C.lp(it["src"])))
             if i % 25 == 0:
                 _set(done=i)
+
+        # 1b) вертикальные / slow-mo
+        if req.split_video:
+            vids = [it for it in items if it["kind"] == "footage"]
+            if vids:
+                _set(message="Читаю параметры видео…", done=0, found=len(vids))
+                with ThreadPoolExecutor(max_workers=min(8, (os.cpu_count() or 4))) as ex:
+                    for it, info in zip(vids, ex.map(lambda x: C.video_info(Path(C.lp(x["src"]))), vids)):
+                        it["vgroup"] = C.video_group(info)
+                        it["vinfo"] = info
 
         # 2) дубликаты (одинаковый размер → полный хэш)
         if req.dups:
@@ -179,17 +201,26 @@ def _scan(req: ScanReq) -> None:
             for group in by_size.values():
                 if len(group) < 2:
                     continue
-                seen: dict[str, dict] = {}
-                for it in sorted(group, key=lambda x: x["rel"]):
+                by_quick: dict[str, list[dict]] = defaultdict(list)
+                for it in group:
                     try:
-                        h = C.file_hash(Path(it["src"]))
+                        by_quick[C.quick_hash(Path(it["src"]))].append(it)
                     except OSError:
+                        pass
+                for sub in by_quick.values():
+                    if len(sub) < 2:
                         continue
-                    if h in seen:
-                        it["dup_of"] = seen[h]["rel"]
-                        it["kind"] = "dup"
-                    else:
-                        seen[h] = it
+                    seen: dict[str, dict] = {}
+                    for it in sorted(sub, key=lambda x: x["rel"]):
+                        try:
+                            h = C.file_hash(Path(it["src"]))
+                        except OSError:
+                            continue
+                        if h in seen:
+                            it["dup_of"] = seen[h]["rel"]
+                            it["kind"] = "dup"
+                        else:
+                            seen[h] = it
 
         # 3) миниатюры + содержимое
         need_thumbs = [it for it in items if it["kind"] in ("image", "footage", "graphics")]
@@ -198,14 +229,21 @@ def _scan(req: ScanReq) -> None:
 
         def job(it):
             out = CACHE_DIR / f"{it['id']}_{abs(hash(it['src'])) % 10**8}.jpg"
-            ok = C.make_thumb(Path(it["src"]), it["kind"], out)
-            return it["id"], (out if ok else None)
+            src = Path(C.lp(it["src"]))
+            if it["kind"] == "footage":
+                th, frames = C.video_thumbs(src, out)
+                return it["id"], th, frames
+            ok = C.make_thumb(src, it["kind"], out)
+            return it["id"], (out if ok else None), [out] if ok else []
 
+        frames_of: dict[int, list[Path]] = {}
         with ThreadPoolExecutor(max_workers=min(8, (os.cpu_count() or 4))) as ex:
-            for n, (iid, out) in enumerate(ex.map(job, need_thumbs), 1):
+            for n, (iid, out, frames) in enumerate(ex.map(job, need_thumbs), 1):
                 if out:
                     thumbs[iid] = out
+                    frames_of[iid] = frames
                     items[iid]["thumb"] = True
+                    items[iid]["thumb_path"] = str(out)
                 if n % 10 == 0:
                     _set(done=n, found=len(need_thumbs))
 
@@ -215,10 +253,10 @@ def _scan(req: ScanReq) -> None:
                 _set(message="Загружаю модель CLIP…")
                 if CLIP.load():
                     _set(message=f"ИИ смотрит на кадры ({CLIP.device})…", done=0, found=len(targets))
-                    B = 64
+                    B = 32
                     for i in range(0, len(targets), B):
                         chunk = targets[i:i + B]
-                        topics = CLIP.classify([thumbs[t["id"]] for t in chunk])
+                        topics = CLIP.classify([frames_of.get(t["id"]) or [thumbs[t["id"]]] for t in chunk])
                         for t, topic in zip(chunk, topics):
                             t["topic"] = topic
                         _set(done=min(i + B, len(targets)))
@@ -362,60 +400,117 @@ def thumb(item_id: int):
         items = STATE["items"]
     if not 0 <= item_id < len(items):
         raise HTTPException(404)
-    it = items[item_id]
-    for f in CACHE_DIR.glob(f"{item_id}_*.jpg"):
-        return FileResponse(f, headers={"Cache-Control": "max-age=3600"})
+    tp = items[item_id].get("thumb_path")
+    if tp and os.path.exists(tp):
+        return FileResponse(tp, headers={"Cache-Control": "max-age=3600"})
     raise HTTPException(404)
 
 
+def _choices(it: dict) -> list[str]:
+    """Папки, куда можно вручную перенести этот файл."""
+    kind = it["kind"]
+    base = C.DIRS[kind]
+    if kind == "footage" and it.get("vgroup"):
+        base = f"{base}/{it['vgroup']}"
+    if kind in ("image", "footage"):
+        return [base] + [f"{base}/{t}" for t in list(C.TOPICS) + [C.UNKNOWN_TOPIC]]
+    if kind == "sfx":
+        cats = list(dict.fromkeys(c for c, _, _ in C.SFX_TAGS)) + [C.UNKNOWN_SFX]
+        return [base] + [f"{base}/{c}" for c in cats]
+    if kind == "music":
+        return [base] + [f"{base}/{m[0]}" for m in C.MOODS] + [f"{base}/{C.UNKNOWN_SFX}"]
+    return []
+
+
+@app.get("/api/choices/{item_id}")
+def choices(item_id: int):
+    with LOCK:
+        items = STATE["items"]
+        if STATE["phase"] != "ready" or not 0 <= item_id < len(items):
+            raise HTTPException(404)
+        return {"dirs": _choices(items[item_id])}
+
+
+class SetDirReq(BaseModel):
+    id: int
+    dir: str
+
+
+@app.post("/api/set_dir")
+def set_dir(req: SetDirReq):
+    with LOCK:
+        items = STATE["items"]
+        if STATE["phase"] != "ready" or not 0 <= req.id < len(items):
+            raise HTTPException(409, "Нечего менять")
+        it = items[req.id]
+        if req.dir not in _choices(it):
+            raise HTTPException(400, "Сюда этот файл переносить нельзя")
+        it["target_dir"] = req.dir
+    return {"ok": True}
+
+
 def _unique(dst: Path) -> Path:
-    if not dst.exists():
+    if not os.path.exists(C.lp(dst)):
         return dst
     stem, suf, n = dst.stem, dst.suffix, 1
     while True:
         cand = dst.with_name(f"{stem}_{n}{suf}")
-        if not cand.exists():
+        if not os.path.exists(C.lp(cand)):
             return cand
         n += 1
 
 
 @app.post("/api/apply")
 def apply(req: ApplyReq):
+    copy = req.mode == "copy"
     with LOCK:
         if STATE["phase"] != "ready":
             raise HTTPException(409, "Сначала просканируй папку")
         items = list(STATE["items"])
         dest = Path(STATE["dest"])
+        if copy:  # хватит ли места под копии
+            need = sum(it["size"] for it in items
+                       if it["target_dir"] not in req.exclude and it["kind"] != "dup")
+            free = shutil.disk_usage(dest).free
+            if need * 1.02 + 500 * 2**20 > free:
+                raise HTTPException(400, f"Не хватает места для копий: нужно {need / 2**30:.1f} ГБ, свободно {free / 2**30:.1f} ГБ")
         STATE["phase"] = "applying"
     moves, errors = [], []
     try:
         for d in list(C.DIRS.values()) + C.EXTRA_DIRS:
             if d.split("/")[0] in {"99_Duplicates", "06_Other"}:
                 continue
-            (dest / d).mkdir(parents=True, exist_ok=True)
+            os.makedirs(C.lp(dest / d), exist_ok=True)
         for it in items:
             if it["target_dir"] in req.exclude:
                 continue
+            if copy and it["kind"] == "dup":
+                continue  # копии копий не плодим
             src = Path(it["src"])
             dst = dest / it["target_dir"] / (it.get("new_name") or it["name"])
-            if src.resolve() == dst.resolve() or not src.exists():
+            if os.path.normcase(os.path.abspath(src)) == os.path.normcase(os.path.abspath(dst)) \
+                    or not os.path.exists(C.lp(src)):
                 continue
             try:
-                dst.parent.mkdir(parents=True, exist_ok=True)
+                os.makedirs(C.lp(dst.parent), exist_ok=True)
                 dst = _unique(dst)
-                shutil.move(str(src), str(dst))
-                moves.append({"from": str(src), "to": str(dst)})
+                if copy:
+                    shutil.copy2(C.lp(src), C.lp(dst))
+                else:
+                    shutil.move(C.lp(src), C.lp(dst))
+                moves.append({"from": str(src), "to": str(dst), "copied": copy})
             except Exception as e:  # noqa: BLE001
                 errors.append(f"{it['name']}: {e}")
         # убрать опустевшие исходные папки (структуру проекта не трогаем)
-        keep = {d.split("/")[0] for d in list(C.DIRS.values()) + C.EXTRA_DIRS}
-        for d in sorted(dest.rglob("*"), key=lambda p: len(p.parts), reverse=True):
-            try:
-                rel = d.relative_to(dest)
-                if d.is_dir() and rel.parts[0] not in keep and LOG_DIRNAME not in rel.parts and not any(d.iterdir()):
-                    d.rmdir()
-            except (OSError, ValueError):
-                pass
+        if not copy:
+            keep = {d.split("/")[0] for d in list(C.DIRS.values()) + C.EXTRA_DIRS}
+            for d in sorted(dest.rglob("*"), key=lambda p: len(p.parts), reverse=True):
+                try:
+                    rel = d.relative_to(dest)
+                    if d.is_dir() and rel.parts[0] not in keep and LOG_DIRNAME not in rel.parts and not any(d.iterdir()):
+                        d.rmdir()
+                except (OSError, ValueError):
+                    pass
         if moves:
             logdir = dest / LOG_DIRNAME
             logdir.mkdir(exist_ok=True)
@@ -423,7 +518,7 @@ def apply(req: ApplyReq):
                 json.dumps(moves, ensure_ascii=False, indent=1), encoding="utf-8")
     finally:
         _set(phase="idle", items=[], message="Применено")
-    return {"moved": len(moves), "errors": errors}
+    return {"moved": len(moves), "errors": errors, "copied": copy}
 
 
 @app.post("/api/undo")
@@ -440,11 +535,19 @@ def undo():
     for m in reversed(moves):
         src, dst = Path(m["to"]), Path(m["from"])
         try:
-            if not src.exists():
+            if not os.path.exists(C.lp(src)):
                 continue
-            dst.parent.mkdir(parents=True, exist_ok=True)
+            if m.get("copied"):
+                # копию удаляем только если оригинал на месте и файлы совпадают по размеру
+                if os.path.exists(C.lp(dst)) and os.path.getsize(C.lp(src)) == os.path.getsize(C.lp(dst)):
+                    os.remove(C.lp(src))
+                    restored += 1
+                else:
+                    errors.append(f"{src.name}: оригинал изменён или удалён, копию не трогаю")
+                continue
+            os.makedirs(C.lp(dst.parent), exist_ok=True)
             dst = _unique(dst)
-            shutil.move(str(src), str(dst))
+            shutil.move(C.lp(src), C.lp(dst))
             restored += 1
         except Exception as e:  # noqa: BLE001
             errors.append(str(e))

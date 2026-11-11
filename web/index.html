@@ -55,6 +55,13 @@ aside{display:flex;flex-direction:column;min-height:0;border-left:1px solid var(
 .card.open .files{display:block}
 .files div{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;padding:1px 0}
 .files .d{color:var(--bad)}
+.files .ed{cursor:pointer}
+.files .ed:hover{color:var(--text);background:#232738}
+#menu{position:fixed;z-index:20;background:#1d2030;border:1px solid var(--accent);border-radius:10px;padding:4px;max-height:60vh;overflow:auto;min-width:220px;box-shadow:0 10px 30px rgba(0,0,0,.5);display:none}
+#menu .h{padding:6px 10px;color:var(--muted);font-size:12px}
+#menu button{display:block;width:100%;text-align:left;border:0;border-radius:6px;padding:6px 10px;background:none;font-size:13px}
+#menu button:hover{background:#2b2f4a}
+select{font:inherit;color:var(--text);background:var(--card);border:1px solid var(--line);padding:8px 10px;border-radius:8px}
 #empty{grid-column:1/-1;color:var(--muted);text-align:center;padding:50px 20px}
 footer{display:flex;gap:10px;align-items:center;padding:10px 14px;border-top:1px solid var(--line);background:rgba(13,14,19,.7)}
 footer .sum{flex:1;color:var(--muted)}
@@ -71,6 +78,7 @@ footer .sum b{color:var(--text)}
   <button id="pick" title="Выбрать папку">Обзор…</button>
   <label class="opt"><input type="checkbox" id="optContent" checked>По содержимому (ИИ)</label>
   <label class="opt"><input type="checkbox" id="optRename" checked>Переименовать звуки</label>
+  <label class="opt"><input type="checkbox" id="optSplit" checked title="Вертикальные (9:16) и slow-mo (60+ fps) видео в отдельные подпапки">Вертикальные/slow-mo отдельно</label>
   <label class="opt"><input type="checkbox" id="optDups" checked>Дубликаты</label>
   <button class="primary" id="scan">Сканировать</button>
 </header>
@@ -92,10 +100,12 @@ footer .sum b{color:var(--text)}
 <footer>
   <div class="sum" id="sum">—</div>
   <button id="undo" disabled>Отменить последнюю сортировку</button>
+  <select id="mode" title="Копирование не трогает исходные файлы, но занимает место"><option value="move">Перемещать</option><option value="copy">Копировать</option></select>
   <button class="primary" id="apply" disabled>Применить</button>
 </footer>
 
 <canvas id="fx"></canvas>
+<div id="menu"></div>
 <div id="toast"></div>
 
 <script>
@@ -134,7 +144,12 @@ function clearCards() {
   $('#cards').innerHTML = '<div id="empty">Здесь появятся папки, куда уедут файлы.<br>Пока ничего не перемещается: сначала предпросмотр.</div>';
   $('#apply').disabled = true; updateSummary();
 }
-function buildCards() {
+const RU = {Footage:'Видео', Music:'Музыка', SFX:'SFX', Images:'Картинки', Graphics:'Графика', Project:'Проекты', Other:'Прочее', Duplicates:'Дубликаты', Audio:'Аудио'};
+const ru = s => { s = s.replace(/^\d+_/, ''); return RU[s] || s; };
+const dirLabel = d => d.split('/').map(ru).join(' / ');
+const EDITABLE = new Set(['footage', 'image', 'sfx', 'music']);
+
+function buildCards(keep) {
   const box = $('#cards'); box.innerHTML = '';
   const byDir = {};
   for (const it of plan.items) (byDir[it.dir] ||= []).push(it);
@@ -150,23 +165,55 @@ function buildCards() {
       <div class="mv ${c.moves ? '' : 'zero'}">${c.moves ? 'переедет: ' + c.moves : 'уже на месте'}</div>
       <div class="collage">${th.map(i => `<img loading="lazy" src="/api/thumb/${i.id}">`).join('') + '<div></div>'.repeat(Math.max(0, 4 - th.length))}</div>
       <div class="files"></div>`;
-    const RU = {Footage:'Видео', Music:'Музыка', SFX:'SFX', Images:'Картинки', Graphics:'Графика', Project:'Проекты', Other:'Прочее', Duplicates:'Дубликаты', Audio:'Аудио'};
-    const ru = s => { s = s.replace(/^\d+_/, ''); return RU[s] || s; };
     el.querySelector('.ttl').textContent = ru(title);
-    el.querySelector('.par').textContent = parent ? parent.split('/').map(ru).join(' / ') : ' ';
+    el.querySelector('.par').textContent = parent ? dirLabel(parent) : ' ';
     const files = el.querySelector('.files');
-    for (const i of items.slice(0, 60)) { const d = document.createElement('div'); d.textContent = i.name + (i.new_name ? '  →  ' + i.new_name : '') + (i.bpm ? '  (~' + i.bpm + ' bpm)' : '') + (i.dup_of ? '  ⟵ копия ' + i.dup_of : ''); if (i.dup_of) d.className = 'd'; files.appendChild(d); }
+    for (const i of items.slice(0, 60)) { const d = document.createElement('div'); d.textContent = i.name + (i.new_name ? '  →  ' + i.new_name : '') + (i.bpm ? '  (~' + i.bpm + ' bpm)' : '') + (i.dup_of ? '  ⟵ копия ' + i.dup_of : ''); if (i.dup_of) d.className = 'd'; if (EDITABLE.has(i.kind)) { d.classList.add('ed'); d.title = 'Нажми, чтобы перенести в другую папку'; d.onclick = e => openMenu(e, i); } files.appendChild(d); }
     if (items.length > 60) { const d = document.createElement('div'); d.textContent = `… и ещё ${items.length - 60}`; files.appendChild(d); }
     const cb = el.querySelector('input');
     cb.onchange = () => { c.on = cb.checked; el.classList.toggle('off', !cb.checked); updateSummary(); };
     el.querySelector('.top').onclick = e => { if (e.target !== cb) el.classList.toggle('open'); };
-    c.on = true;
+    c.on = keep ? (keep.on[c.dir] ?? true) : true;
+    cb.checked = c.on; el.classList.toggle('off', !c.on);
+    if (keep && keep.open.has(c.dir)) el.classList.add('open');
     box.appendChild(el);
     cardEls.set(c.dir, {el, data: c, cnt: el.querySelector('.cnt'), arrived: 0, total: 0});
   }
   applyTab();
 }
 function setCount(rec, v) { rec.cnt.textContent = v; }
+
+async function refreshPlan() {
+  const keep = {on: {}, open: new Set()};
+  for (const [d, r] of cardEls) { keep.on[d] = r.data.on !== false; if (r.el.classList.contains('open')) keep.open.add(d); }
+  const boxTop = $('#cards').scrollTop;
+  cardEls.clear(); plan = await api('/api/plan'); buildCards(keep);
+  for (const [, r] of cardEls) setCount(r, r.data.count);
+  $('#cards').scrollTop = boxTop; updateSummary();
+}
+async function openMenu(e, it) {
+  e.stopPropagation();
+  const menu = $('#menu');
+  let dirs;
+  try { dirs = (await api('/api/choices/' + it.id)).dirs; } catch (err) { return toast(err.message); }
+  menu.innerHTML = '';
+  const h = document.createElement('div'); h.className = 'h'; h.textContent = 'Перенести «' + it.name + '» в:'; menu.appendChild(h);
+  for (const d of dirs) {
+    const b = document.createElement('button'); b.textContent = dirLabel(d) + (d === it.dir ? '  ✓' : '');
+    b.onclick = async () => {
+      menu.style.display = 'none';
+      if (d === it.dir) return;
+      try { await api('/api/set_dir', {method: 'POST', body: JSON.stringify({id: it.id, dir: d})}); await refreshPlan(); }
+      catch (err) { toast(err.message); }
+    };
+    menu.appendChild(b);
+  }
+  menu.style.display = 'block';
+  const r = menu.getBoundingClientRect();
+  menu.style.left = Math.max(8, Math.min(e.clientX, innerWidth - r.width - 8)) + 'px';
+  menu.style.top = Math.max(8, Math.min(e.clientY, innerHeight - r.height - 8)) + 'px';
+}
+addEventListener('click', e => { if (!e.target.closest('#menu')) $('#menu').style.display = 'none'; });
 function updateSummary() {
   if (!plan) { $('#sum').textContent = '—'; return; }
   let mv = 0, all = plan.items.length;
@@ -264,7 +311,7 @@ function frame(now) {
 requestAnimationFrame(frame);
 
 function arrive(p) {
-  const rec = cardEls.get(p.dir); if (!rec) return;
+  const rec = cardEls.get(p.dir); if (!rec || !rec.total) return;
   rec.arrived++;
   const frac = rec.arrived / rec.total;
   setCount(rec, Math.round(rec.data.count * frac));
@@ -337,7 +384,7 @@ $('#scan').onclick = async () => {
   const path = $('#path').value.trim();
   if (!path) return toast('Укажи папку');
   clearCards();
-  try { await api('/api/scan', {method: 'POST', body: JSON.stringify({path, content: $('#optContent').checked, dups: $('#optDups').checked, rename: $('#optRename').checked})}); }
+  try { await api('/api/scan', {method: 'POST', body: JSON.stringify({path, content: $('#optContent').checked, dups: $('#optDups').checked, rename: $('#optRename').checked, split_video: $('#optSplit').checked})}); }
   catch (e) { return toast(e.message); }
   localStorage.setItem?.('ms_path', path);
   setPhase('scanning'); ensureParticles(160); speed = 0.35; setStatus('Сканирую…', '', 0); poll();
@@ -351,16 +398,17 @@ $('#apply').onclick = async () => {
   const exclude = plan.cards.filter(c => c.on === false).map(c => c.dir);
   setPhase('applying'); $('#apply').disabled = true;
   try {
-    const r = await api('/api/apply', {method: 'POST', body: JSON.stringify({exclude})});
-    toast(`Перемещено: ${r.moved}` + (r.errors.length ? `, ошибок: ${r.errors.length}` : ''));
-    setStatus(`Готово: перемещено ${r.moved} ${pluralFiles(r.moved)}`, 'Можно отменить кнопкой справа внизу');
+    const r = await api('/api/apply', {method: 'POST', body: JSON.stringify({exclude, mode: $('#mode').value})});
+    const verb = r.copied ? 'Скопировано' : 'Перемещено';
+    toast(`${verb}: ${r.moved}` + (r.errors.length ? `, ошибок: ${r.errors.length}` : ''));
+    setStatus(`Готово: ${verb.toLowerCase()} ${r.moved} ${pluralFiles(r.moved)}`, 'Можно отменить кнопкой справа внизу');
     clearCards(); setPhase('idle');
     ensureParticles(160); parts.length = 0; ensureParticles(120);
   } catch (e) { toast(e.message); setPhase('ready'); }
   poll2();
 };
 $('#undo').onclick = async () => {
-  try { const r = await api('/api/undo', {method: 'POST'}); toast(`Возвращено файлов: ${r.restored}`); setStatus('Сортировка отменена', ''); clearCards(); }
+  try { const r = await api('/api/undo', {method: 'POST'}); toast(`Возвращено файлов: ${r.restored}` + (r.errors.length ? `, пропущено: ${r.errors.length}` : '')); setStatus('Сортировка отменена', ''); clearCards(); }
   catch (e) { toast(e.message); }
   poll2();
 };

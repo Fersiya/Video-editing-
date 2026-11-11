@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -43,6 +44,29 @@ KIND_TITLES = {
 
 HAS_FFMPEG = shutil.which("ffmpeg") is not None
 HAS_FFPROBE = shutil.which("ffprobe") is not None
+
+
+# ---------- Длинные пути Windows ----------
+IS_WIN = os.name == "nt"
+
+
+def lp(p, force: bool = False) -> str:
+    """Путь с префиксом \\?\\ для Windows (обход лимита 260 символов). Вне Windows — как есть."""
+    s = str(p)
+    if not IS_WIN or s.startswith("\\\\?\\") or (not force and len(s) < 240):
+        return s
+    s = os.path.abspath(s)
+    if s.startswith("\\\\"):
+        return "\\\\?\\UNC\\" + s[2:]
+    return "\\\\?\\" + s
+
+
+def unlp(s: str) -> str:
+    if s.startswith("\\\\?\\UNC\\"):
+        return "\\\\" + s[8:]
+    if s.startswith("\\\\?\\"):
+        return s[4:]
+    return s
 
 
 def _run(cmd: list[str], timeout: int = 30) -> subprocess.CompletedProcess:
@@ -91,12 +115,108 @@ def classify_kind(path: Path) -> str:
     return "other"
 
 
+def quick_hash(path: Path, block: int = 65536) -> str:
+    """Быстрый отпечаток: размер + первые и последние 64 КБ. Только для отсева, не для вывода «это копия»."""
+    h = hashlib.sha1()
+    size = os.path.getsize(lp(path))
+    h.update(str(size).encode())
+    with open(lp(path), "rb") as f:
+        h.update(f.read(block))
+        if size > 2 * block:
+            f.seek(-block, os.SEEK_END)
+            h.update(f.read(block))
+    return h.hexdigest()
+
+
 def file_hash(path: Path, chunk: int = 1 << 20) -> str:
     h = hashlib.sha1()
-    with open(path, "rb") as f:
+    with open(lp(path), "rb") as f:
         while b := f.read(chunk):
             h.update(b)
     return h.hexdigest()
+
+
+
+SLOWMO_FPS = 59  # 59.94/60/100/120/240; 50 fps в PAL-странах — обычная съёмка, не slow-mo
+
+
+def video_info(path: Path) -> dict | None:
+    """Ширина/высота (с учётом поворота) и fps. None, если ffprobe нет или файл не читается."""
+    if not HAS_FFPROBE:
+        return None
+    try:
+        r = _run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+                  "stream=width,height,r_frame_rate,avg_frame_rate:stream_tags=rotate:stream_side_data=rotation",
+                  "-of", "json", lp(path)])
+        st = json.loads(r.stdout)["streams"][0]
+        w, h = int(st["width"]), int(st["height"])
+        rot = 0
+        try:
+            rot = int(float((st.get("tags") or {}).get("rotate", 0)))
+        except (TypeError, ValueError):
+            pass
+        for sd in st.get("side_data_list") or []:
+            if "rotation" in sd:
+                rot = int(float(sd["rotation"]))
+        if abs(rot) % 180 == 90:
+            w, h = h, w
+
+        def fr(x: str) -> float:
+            a, _, b = x.partition("/")
+            return float(a) / float(b) if float(b or 1) else 0.0
+
+        fps = fr(st.get("avg_frame_rate", "0/1")) or fr(st.get("r_frame_rate", "0/1"))
+        return {"w": w, "h": h, "fps": round(fps, 2)}
+    except Exception:
+        return None
+
+
+def video_group(info: dict | None) -> str:
+    """Подпапка для видео: Вертикальные / Slow-mo (или пусто)."""
+    if not info:
+        return ""
+    parts = []
+    if info["h"] > info["w"] * 1.05:
+        parts.append("Вертикальные")
+    if info["fps"] >= SLOWMO_FPS:
+        parts.append("Slow-mo")
+    return "/".join(parts)
+
+
+def _is_dark(p: Path) -> bool:
+    """Чёрный или пустой кадр (заставка, крышка объектива)."""
+    try:
+        from PIL import ImageStat
+        with Image.open(p) as im:
+            st = ImageStat.Stat(im.convert("L"))
+        return st.mean[0] < 14 or st.stddev[0] < 4
+    except Exception:
+        return False
+
+
+def video_thumbs(src: Path, out: Path, size: int = 256) -> tuple[Path | None, list[Path]]:
+    """Три кадра (20/50/80 %). Возвращает (миниатюра, кадры для ИИ без чёрных)."""
+    if not HAS_FFMPEG:
+        return None, []
+    out.parent.mkdir(parents=True, exist_ok=True)
+    dur = duration_seconds(src) or 0.0
+    fractions = [0.2, 0.5, 0.8] if dur > 3 else [0.5]
+    frames: list[Path] = []
+    for k, fr in enumerate(fractions):
+        fp = out.with_name(f"{out.stem}_f{k}.jpg")
+        for ts in ((dur * fr if dur else 1.0), 0.0):  # второй заход — с начала, если файл короче
+            r = _run(["ffmpeg", "-v", "error", "-y", "-ss", f"{ts:.2f}", "-i", lp(src),
+                      "-frames:v", "1", "-vf", f"scale={size}:-2", "-q:v", "4", str(fp)], 60)
+            if r.returncode == 0 and fp.exists():
+                frames.append(fp)
+                break
+    if not frames:
+        return None, []
+    good = [f for f in frames if not _is_dark(f)]
+    use = good or frames
+    best = use[len(use) // 2]
+    shutil.copyfile(best, out)
+    return out, use
 
 
 def make_thumb(src: Path, kind: str, out: Path, size: int = 256) -> bool:
@@ -116,7 +236,7 @@ def make_thumb(src: Path, kind: str, out: Path, size: int = 256) -> bool:
         if kind in ("image", "graphics"):
             if src.suffix.lower() in GRAPHICS:
                 return False
-            with Image.open(src) as im:
+            with Image.open(lp(src)) as im:
                 im.thumbnail((size, size))
                 if im.mode in ("RGBA", "LA", "P"):
                     im = im.convert("RGBA")
@@ -202,30 +322,38 @@ class Clip:
             self.error = f"не удалось загрузить модель: {e}"
             return False
 
-    def classify(self, thumbs: list[Path]) -> list[str]:
+    def classify(self, groups: list[list[Path]]) -> list[str]:
+        """groups[i] — один или несколько кадров одного файла; эмбеддинги усредняются."""
         torch = self._torch
         out: list[str] = []
-        B = 32
-        for i in range(0, len(thumbs), B):
-            batch = thumbs[i:i + B]
-            imgs, idx = [], []
-            for j, p in enumerate(batch):
-                try:
-                    imgs.append(Image.open(p).convert("RGB"))
-                    idx.append(j)
-                except Exception:
-                    pass
+        B = 16
+        for i in range(0, len(groups), B):
+            batch = groups[i:i + B]
+            imgs, owner = [], []
+            for gi, paths in enumerate(batch):
+                for p in paths:
+                    try:
+                        with Image.open(p) as im:
+                            imgs.append(im.convert("RGB"))
+                        owner.append(gi)
+                    except Exception:
+                        pass
             res = [UNKNOWN_TOPIC] * len(batch)
             if imgs:
                 with torch.no_grad():
                     inp = self._proc(images=imgs, return_tensors="pt").to(self.device)
                     f = _feat(self._model.get_image_features(**inp))
                     f = f / f.norm(dim=-1, keepdim=True)
-                    probs = (100.0 * f @ self._text.T).softmax(dim=-1)
-                    conf, arg = probs.max(dim=-1)
-                for k, j in enumerate(idx):
-                    if conf[k].item() >= MIN_CONFIDENCE:
-                        res[j] = self._names[arg[k].item()]
+                    for gi in range(len(batch)):
+                        rows = [k for k, o in enumerate(owner) if o == gi]
+                        if not rows:
+                            continue
+                        m = f[rows].mean(dim=0)
+                        m = m / m.norm()
+                        probs = (100.0 * m @ self._text.T).softmax(dim=-1)
+                        conf, arg = probs.max(dim=-1)
+                        if conf.item() >= MIN_CONFIDENCE:
+                            res[gi] = self._names[arg.item()]
             out.extend(res)
         return out
 
@@ -278,6 +406,14 @@ SFX_TAGS: list[tuple[str, str, str]] = [
     ("Техника", "phone", "a phone ringing"),
     ("Техника", "machine", "a machine humming"),
     ("Техника", "clock", "a ticking clock"),
+    ("Атмосфера", "ambience_room", "quiet room tone background ambience"),
+    ("Атмосфера", "ambience_cafe", "busy cafe or restaurant background chatter"),
+    ("Атмосфера", "ambience_city", "city street traffic ambience"),
+    ("Атмосфера", "ambience_nature", "forest nature ambience with birds and wind"),
+    ("Атмосфера", "ambience_rain", "steady rain ambience"),
+    ("Атмосфера", "ambience_sea", "ocean waves ambience"),
+    ("Атмосфера", "ambience_crowd", "murmuring crowd ambience"),
+    ("Атмосфера", "ambience_drone", "a continuous machine hum or drone"),
     ("Музыкальные", "drum", "a drum hit"),
     ("Музыкальные", "bass_drop", "a bass drop"),
     ("Музыкальные", "riser", "a rising synth riser"),
@@ -297,6 +433,7 @@ MOODS: list[tuple[str, str, str]] = [
     ("Лоу-фай", "lofi", "lofi chill beats"),
 ]
 UNKNOWN_SFX = "Разное"
+AMBIENCE_CAT = "Атмосфера"
 SFX_MIN_CONF = 0.10
 MOOD_MIN_CONF = 0.20
 CLAP_SR = 48000
@@ -417,3 +554,32 @@ class AudioClap:
 
     def music(self, arrays):
         return self._rank(arrays, self._mood_t, MOODS, MOOD_MIN_CONF, UNKNOWN_SFX)
+
+    def joint(self, arrays):
+        """Для каждого звука: вероятность «музыка» / «атмосфера» и лучшие метки.
+        Нужно, чтобы не полагаться только на длительность (амбиенты длинные, джинглы короткие)."""
+        torch = self._torch
+        n_sfx = len(SFX_TAGS)
+        amb = [i for i, (c, _, _) in enumerate(SFX_TAGS) if c == AMBIENCE_CAT]
+        allt = torch.cat([self._sfx_t, self._mood_t])
+        out = []
+        B = 16
+        for i in range(0, len(arrays), B):
+            f = self._audio(arrays[i:i + B])
+            probs = (self._scale * f @ allt.T).softmax(dim=-1)
+            sfx_p = (self._scale * f @ self._sfx_t.T).softmax(dim=-1)
+            mood_p = (self._scale * f @ self._mood_t.T).softmax(dim=-1)
+            for r in range(f.shape[0]):
+                sc, si = sfx_p[r].max(dim=0)
+                mc, mi = mood_p[r].max(dim=0)
+                k = amb[int(probs[r, amb].argmax())]
+                cat, tag, _ = SFX_TAGS[int(si)]
+                mcat, mtag, _ = MOODS[int(mi)]
+                out.append({
+                    "p_music": float(probs[r, n_sfx:].sum()),
+                    "p_amb": float(probs[r, amb].sum()),
+                    "sfx": (cat, tag, float(sc)) if float(sc) >= SFX_MIN_CONF else (UNKNOWN_SFX, None, float(sc)),
+                    "mood": (mcat, mtag, float(mc)) if float(mc) >= MOOD_MIN_CONF else (UNKNOWN_SFX, None, float(mc)),
+                    "amb": (SFX_TAGS[k][0], SFX_TAGS[k][1]),
+                })
+        return out
