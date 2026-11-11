@@ -8,12 +8,25 @@ import shutil
 import subprocess
 from pathlib import Path
 
-from PIL import Image
+from functools import lru_cache
 
-VIDEO = {".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v", ".mts", ".m2ts", ".mxf", ".wmv", ".flv"}
-AUDIO = {".mp3", ".wav", ".flac", ".aac", ".ogg", ".m4a", ".aiff", ".aif", ".wma", ".opus"}
-IMAGE = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff", ".gif", ".heic"}
-GRAPHICS = {".psd", ".ai", ".eps", ".svg", ".xcf", ".sketch", ".fig"}
+from PIL import Image, ImageOps
+
+Image.MAX_IMAGE_PIXELS = None  # свои панорамы и сканы не считаем «бомбой»
+try:  # HEIC/HEIF (фото с iPhone): нужен pillow-heif, если не поставился — такие файлы просто без миниатюр
+    from pillow_heif import register_heif_opener
+    register_heif_opener()
+except Exception:
+    pass
+
+VIDEO = {".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v", ".mts", ".m2ts", ".mxf", ".wmv", ".flv", ".3gp", ".3g2",
+         ".mpg", ".mpeg", ".m2v", ".vob", ".ogv", ".mod", ".asf", ".f4v", ".divx", ".insv", ".r3d", ".braw"}
+AUDIO = {".mp3", ".wav", ".flac", ".aac", ".ogg", ".m4a", ".aiff", ".aif", ".wma", ".opus", ".mka", ".ac3", ".eac3",
+         ".amr", ".wv", ".ape", ".caf", ".3ga", ".oga", ".weba"}
+IMAGE = {".jpg", ".jpeg", ".jpe", ".jfif", ".png", ".apng", ".webp", ".avif", ".bmp", ".tif", ".tiff", ".gif", ".heic", ".heif",
+         ".tga", ".ico", ".jp2", ".ppm", ".pgm", ".pbm"}
+RAW_PHOTO = {".cr2", ".cr3", ".nef", ".arw", ".dng", ".orf", ".rw2", ".raf", ".srw", ".pef"}  # без миниатюр, но это фото
+GRAPHICS = {".psd", ".psb", ".ai", ".eps", ".svg", ".xcf", ".sketch", ".fig", ".xd", ".cdr", ".indd"}
 PROJECT = {".prproj", ".aep", ".aet", ".drp", ".veg", ".kdenlive", ".fcpxml", ".mogrt", ".ae"}
 
 SFX_MAX_SECONDS = 10.0  # аудио короче этого — SFX, длиннее — музыка
@@ -74,6 +87,7 @@ def _run(cmd: list[str], timeout: int = 30) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, capture_output=True, timeout=timeout, creationflags=flags)
 
 
+@lru_cache(maxsize=50000)
 def duration_seconds(path: Path) -> float | None:
     if not HAS_FFPROBE:
         return None
@@ -108,8 +122,10 @@ def classify_kind(path: Path) -> str:
         return "project"
     if ext in GRAPHICS:
         return "graphics"
+    if ext in RAW_PHOTO:
+        return "image"
     if ext in IMAGE:
-        if ext in (".png", ".webp") and png_has_alpha(path):
+        if ext in (".png", ".apng", ".webp", ".avif") and png_has_alpha(path):
             return "graphics"  # PNG с прозрачностью — это графика, а не фото
         return "image"
     return "other"
@@ -219,6 +235,24 @@ def video_thumbs(src: Path, out: Path, size: int = 256) -> tuple[Path | None, li
     return out, use
 
 
+def load_rgb(path, max_side: int):
+    """RGB-картинка не больше max_side: быстрое уменьшение JPEG при чтении, поворот по EXIF,
+    прозрачность кладётся на тёмный фон. Для анимаций (gif/webp) берётся первый кадр."""
+    with Image.open(path) as im:
+        try:
+            im.draft("RGB", (max_side * 2, max_side * 2))
+        except Exception:
+            pass
+        im = ImageOps.exif_transpose(im)
+        im.thumbnail((max_side, max_side))
+        if im.mode in ("RGBA", "LA") or (im.mode == "P" and "transparency" in im.info):
+            im = im.convert("RGBA")
+            bg = Image.new("RGB", im.size, (30, 30, 36))
+            bg.paste(im, mask=im.getchannel("A"))
+            return bg
+        return im.convert("RGB")
+
+
 def make_thumb(src: Path, kind: str, out: Path, size: int = 256) -> bool:
     """Миниатюра JPEG. Для видео — кадр из начала. Для остального — False."""
     if out.exists():
@@ -236,20 +270,25 @@ def make_thumb(src: Path, kind: str, out: Path, size: int = 256) -> bool:
         if kind in ("image", "graphics"):
             if src.suffix.lower() in GRAPHICS:
                 return False
-            with Image.open(lp(src)) as im:
-                im.thumbnail((size, size))
-                if im.mode in ("RGBA", "LA", "P"):
-                    im = im.convert("RGBA")
-                    bg = Image.new("RGB", im.size, (30, 30, 36))
-                    bg.paste(im, mask=im.getchannel("A"))
-                    im = bg
-                else:
-                    im = im.convert("RGB")
-                im.save(out, "JPEG", quality=80)
+            load_rgb(lp(src), size).save(out, "JPEG", quality=80)
             return True
     except Exception:
         return False
     return False
+
+
+def _free(obj, *attrs) -> None:
+    obj.available = False
+    for a in attrs:
+        setattr(obj, a, None)
+    try:
+        import gc
+        gc.collect()
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
 
 
 def _feat(x):
@@ -321,6 +360,10 @@ class Clip:
         except Exception as e:  # noqa: BLE001
             self.error = f"не удалось загрузить модель: {e}"
             return False
+
+    def unload(self) -> None:
+        """Освободить память после скана (человек параллельно монтирует в тяжёлых программах)."""
+        _free(self, "_model", "_proc", "_text")
 
     def classify(self, groups: list[list[Path]]) -> list[dict]:
         """groups[i] — один или несколько кадров одного файла; эмбеддинги усредняются.
@@ -521,6 +564,9 @@ class AudioClap:
         except Exception as e:  # noqa: BLE001
             self.error = f"не удалось загрузить модель CLAP: {e}"
             return False
+
+    def unload(self) -> None:
+        _free(self, "_model", "_proc", "_sfx_t", "_mood_t")
 
     def _embed(self, texts):
         torch = self._torch

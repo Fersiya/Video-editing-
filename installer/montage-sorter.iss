@@ -28,8 +28,8 @@ Name: "russian"; MessagesFile: "compiler:Languages\Russian.isl"
 
 [Tasks]
 Name: "desktopicon"; Description: "Ярлык на рабочем столе"; GroupDescription: "Ярлыки:"
-Name: "ai_cpu"; Description: "ИИ-режим на процессоре (докачает ~300 МБ)"; GroupDescription: "Сортировка по содержимому (ИИ):"; Flags: exclusive
-Name: "ai_gpu"; Description: "ИИ-режим на видеокарте NVIDIA (докачает ~2.5 ГБ)"; GroupDescription: "Сортировка по содержимому (ИИ):"; Flags: exclusive unchecked
+Name: "ai_cpu"; Description: "ИИ-режим на процессоре (докачает ~1.5 ГБ: движок ~300 МБ и модели)"; GroupDescription: "Сортировка по содержимому (ИИ):"; Flags: exclusive
+Name: "ai_gpu"; Description: "ИИ-режим на видеокарте NVIDIA (докачает ~3.5 ГБ, только для карт NVIDIA)"; GroupDescription: "Сортировка по содержимому (ИИ):"; Flags: exclusive unchecked
 Name: "ai_none"; Description: "Без ИИ (сортировка только по типам файлов)"; GroupDescription: "Сортировка по содержимому (ИИ):"; Flags: exclusive unchecked
 
 [Files]
@@ -42,9 +42,10 @@ Name: "{autodesktop}\Montage Sorter"; Filename: "{app}\python\pythonw.exe"; Para
 
 [Run]
 ; ИИ-модули ставятся во встроенный Python (нужен интернет)
-Filename: "{app}\python\python.exe"; Parameters: "-m pip install --no-warn-script-location transformers torch"; StatusMsg: "Ставлю ИИ-модули (несколько минут)…"; Flags: runhidden; Tasks: ai_cpu
-Filename: "{app}\python\python.exe"; Parameters: "-m pip install --no-warn-script-location torch --index-url https://download.pytorch.org/whl/cu124"; StatusMsg: "Ставлю PyTorch для видеокарты (несколько минут)…"; Flags: runhidden; Tasks: ai_gpu
-Filename: "{app}\python\python.exe"; Parameters: "-m pip install --no-warn-script-location transformers"; StatusMsg: "Ставлю transformers…"; Flags: runhidden; Tasks: ai_gpu
+Filename: "{app}\python\python.exe"; Parameters: "-m pip install --no-warn-script-location transformers torch"; StatusMsg: "Ставлю ИИ-модули (несколько минут, идёт в чёрном окне)…"; Tasks: ai_cpu
+Filename: "{app}\python\python.exe"; Parameters: "-m pip install --no-warn-script-location torch --index-url https://download.pytorch.org/whl/cu124"; StatusMsg: "Ставлю PyTorch для видеокарты (несколько минут, идёт в чёрном окне)…"; Tasks: ai_gpu
+Filename: "{app}\python\python.exe"; Parameters: "-m pip install --no-warn-script-location transformers"; StatusMsg: "Ставлю transformers…"; Tasks: ai_gpu
+Filename: "{app}\python\python.exe"; Parameters: "-m app.prefetch"; WorkingDir: "{app}"; StatusMsg: "Скачиваю модели ИИ (около 1.2 ГБ)…"; Tasks: ai_cpu ai_gpu
 Filename: "{app}\python\pythonw.exe"; Parameters: "-m app --autoexit"; WorkingDir: "{app}"; Description: "Запустить Montage Sorter"; Flags: nowait postinstall skipifsilent
 
 [UninstallDelete]

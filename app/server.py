@@ -231,10 +231,12 @@ def _scan(req: ScanReq) -> None:
         _set(found=len(items), message="Определяю типы файлов…")
 
         # 1) тип
-        for i, it in enumerate(items):
-            it["kind"] = C.classify_kind(Path(C.lp(it["src"])))
-            if i % 25 == 0:
-                _set(done=i)
+        C.duration_seconds.cache_clear()
+        with ThreadPoolExecutor(max_workers=min(8, (os.cpu_count() or 4))) as ex:
+            for i, kind in enumerate(ex.map(lambda x: C.classify_kind(Path(C.lp(x["src"]))), items)):
+                items[i]["kind"] = kind
+                if i % 25 == 0:
+                    _set(done=i)
 
         # 1b) вертикальные / slow-mo
         if req.split_video:
@@ -333,6 +335,9 @@ def _scan(req: ScanReq) -> None:
         _set(items=items, phase="ready", message=f"Готово: {len(items)} файлов")
     except Exception as e:  # noqa: BLE001
         _set(phase="error", error=f"{e.__class__.__name__}: {e}")
+    finally:
+        for m in (CLIP, AUDIO):  # модели больше не нужны: отдаём память
+            getattr(m, "unload", lambda: None)()
 
 
 # ---------------- API ----------------
@@ -546,10 +551,7 @@ def preview(item_id: int):
         if kind in ("image", "graphics"):
             out = CACHE_DIR / f"prev_{item_id}.jpg"
             if not out.exists():
-                from PIL import Image
-                with Image.open(src) as im:
-                    im.thumbnail((900, 900))
-                    im.convert("RGB").save(out, "JPEG", quality=85)
+                C.load_rgb(src, 900).save(out, "JPEG", quality=85)
             return FileResponse(out)
         if not C.HAS_FFMPEG:
             raise HTTPException(503, "Нет ffmpeg")
