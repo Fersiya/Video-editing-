@@ -16,6 +16,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
 from . import classify as C
+from . import memory as M
 
 WEB_DIR = Path(__file__).resolve().parent.parent / "web"
 CACHE_DIR = Path(tempfile.gettempdir()) / "montage_sorter_cache"
@@ -38,6 +39,7 @@ STATE: dict = {
     "clip_error": None,
     "audio_ai": None,
     "audio_error": None,
+    "rename": False,
     "error": None,
 }
 
@@ -48,6 +50,7 @@ class ScanReq(BaseModel):
     dups: bool = True
     rename: bool = False  # переименовывать звуки по тегам (нужен ИИ)
     split_video: bool = True  # вертикальные и slow-mo видео в отдельные подпапки
+    help_sens: float = 1.0  # строгость ИИ: больше — чаще просит помощи (0.5–1.5)
 
 
 class ApplyReq(BaseModel):
@@ -137,21 +140,73 @@ def _analyze_audio(items: list[dict], rename: bool) -> None:
             it["topic"] = cat if tag else None
             it["tag"] = tag
             it["conf"] = round(conf, 2)
+            top = r.get("sfx_top") if it["kind"] == "sfx" else r.get("mood_top")
+            it["guesses"] = [{"label": (f"{t} ({c})" if it["kind"] == "sfx" else c), "cat": c, "tag": t, "p": round(pp, 3)}
+                             for c, t, pp in (top or [])]
+            emb = r.get("emb")
+            it["emb"] = _pack(emb)
+            space = "sfx" if it["kind"] == "sfx" else "mood"
+            hit = M.match(space, emb)
+            if hit:  # раньше уже отвечал на похожий звук
+                it["topic"], it["tag"], it["conf"], it["learned"] = hit["topic"], hit.get("tag"), 1.0, True
     _set(done=len(ok), audio_ai=True)
 
     if rename:
-        counters: dict[str, int] = defaultdict(int)
         for it in sorted(items, key=lambda x: x["rel"]):
-            tag = it.get("tag")
-            if it["kind"] not in ("sfx", "music") or not tag:
-                continue
-            ext = Path(it["name"]).suffix
-            if it["kind"] == "sfx":
-                counters[tag] += 1
-                it["new_name"] = f"{tag}_{counters[tag]:02d}{ext}"
-            else:
-                bpm = f"_{it['bpm']}bpm" if it.get("bpm") else ""
-                it["new_name"] = f"{tag}{bpm}_{_safe_stem(Path(it['name']).stem)}{ext}"
+            if it["kind"] in ("sfx", "music") and it.get("tag"):
+                it["new_name"] = _name_for(it, items)
+
+
+def _pack(emb):
+    """Отпечаток как компактный float32-массив (тысячи файлов × 512 чисел не должны жрать память)."""
+    if emb is None:
+        return None
+    try:
+        import numpy as np
+        return np.asarray(emb, dtype=np.float32)
+    except Exception:
+        return emb
+
+
+def _slug(text: str, n: int = 40) -> str:
+    import re
+    t = re.sub(r"[^\w]+", "_", (text or "").strip().lower()).strip("_")
+    return t[:n]
+
+
+def _clean_dir(text: str, n: int = 40) -> str:
+    bad = '<>:"/\\|?*'
+    t = "".join(" " if ch in bad else ch for ch in (text or "")).strip(" .")
+    return " ".join(t.split())[:n]
+
+
+def _name_for(it: dict, items: list[dict]) -> str:
+    """Имя файла по тегу: SFX — tag_NN, музыка — tag_120bpm_Название."""
+    tag, ext = it["tag"], Path(it["name"]).suffix
+    if it["kind"] == "sfx":
+        used = 0
+        for o in items:
+            nn = o.get("new_name") or ""
+            if o is not it and nn.startswith(f"{tag}_") and nn[len(tag) + 1:len(tag) + 3].isdigit():
+                used = max(used, int(nn[len(tag) + 1:len(tag) + 3]))
+        return f"{tag}_{used + 1:02d}{ext}"
+    bpm = f"_{it['bpm']}bpm" if it.get("bpm") else ""
+    return f"{tag}{bpm}_{_safe_stem(Path(it['name']).stem)}{ext}"
+
+
+# Базовые пороги уверенности: ниже — файл попадает в «Нужна помощь» (умножаются на help_sens)
+REVIEW_BASE = {"image": 0.50, "footage": 0.50, "sfx": 0.25, "music": 0.35}
+
+
+def _flag_review(items: list[dict], sens: float) -> None:
+    for it in items:
+        base = REVIEW_BASE.get(it["kind"])
+        if base is None or it.get("learned") or "conf" not in it:
+            continue
+        unknown = (it["kind"] in ("image", "footage") and it.get("topic") in (None, C.UNKNOWN_TOPIC)) or \
+                  (it["kind"] in ("sfx", "music") and not it.get("tag"))
+        if unknown or it["conf"] < base * sens:
+            it["review"] = True
 
 
 def _scan(req: ScanReq) -> None:
@@ -256,14 +311,22 @@ def _scan(req: ScanReq) -> None:
                     B = 32
                     for i in range(0, len(targets), B):
                         chunk = targets[i:i + B]
-                        topics = CLIP.classify([frames_of.get(t["id"]) or [thumbs[t["id"]]] for t in chunk])
-                        for t, topic in zip(chunk, topics):
-                            t["topic"] = topic
+                        results = CLIP.classify([frames_of.get(t["id"]) or [thumbs[t["id"]]] for t in chunk])
+                        for t, r in zip(chunk, results):
+                            t["topic"] = r["topic"]
+                            t["conf"] = round(r["conf"], 2)
+                            t["guesses"] = [{"label": n, "cat": n, "tag": None, "p": round(pp, 3)} for n, pp in r["top"]]
+                            t["emb"] = _pack(r["emb"])
+                            hit = M.match("clip", r["emb"])
+                            if hit:  # раньше уже отвечал на похожий кадр
+                                t["topic"], t["conf"], t["learned"] = hit["topic"], 1.0, True
                         _set(done=min(i + B, len(targets)))
                     _set(clip=True)
                 else:
                     _set(clip=False, clip_error=CLIP.error)
+            _set(rename=bool(req.rename))
             _analyze_audio(items, req.rename)
+            _flag_review(items, max(0.3, min(2.0, req.help_sens)))
 
         for it in items:
             it["target_dir"] = _target_dir(it)
@@ -390,8 +453,10 @@ def plan():
         c["size"] += it["size"]
         out.append({"id": it["id"], "name": it["name"], "rel": it["rel"], "kind": it["kind"],
                     "topic": it.get("topic"), "dir": td, "thumb": bool(it.get("thumb")),
-                    "dup_of": it["dup_of"], "new_name": it.get("new_name"), "bpm": it.get("bpm")})
-    return {"dest": dest, "cards": sorted(cards.values(), key=lambda c: c["dir"]), "items": out}
+                    "dup_of": it["dup_of"], "new_name": it.get("new_name"), "bpm": it.get("bpm"),
+                    "review": bool(it.get("review")), "learned": bool(it.get("learned"))})
+    return {"dest": dest, "cards": sorted(cards.values(), key=lambda c: c["dir"]), "items": out,
+            "review_count": sum(1 for i in out if i["review"]), "memory": M.count()}
 
 
 @app.get("/api/thumb/{item_id}")
@@ -447,6 +512,124 @@ def set_dir(req: SetDirReq):
             raise HTTPException(400, "Сюда этот файл переносить нельзя")
         it["target_dir"] = req.dir
     return {"ok": True}
+
+
+# ---------- «Нужна помощь»: просмотр, прослушивание, ответ ----------
+
+@app.get("/api/review")
+def review():
+    with LOCK:
+        items = [it for it in STATE["items"] if it.get("review")]
+        rename = STATE["rename"]
+    out = []
+    for it in items:
+        out.append({"id": it["id"], "name": it["name"], "rel": it["rel"], "kind": it["kind"],
+                    "thumb": bool(it.get("thumb")), "topic": it.get("topic"), "tag": it.get("tag"),
+                    "conf": it.get("conf"), "guesses": it.get("guesses") or []})
+    cats = list(dict.fromkeys(c for c, _, _ in C.SFX_TAGS))
+    return {"items": out, "rename": rename, "topics": list(C.TOPICS), "sfx_cats": cats,
+            "moods": [m[0] for m in C.MOODS]}
+
+
+@app.get("/api/preview/{item_id}")
+def preview(item_id: int):
+    """Что-то, что гарантированно проиграется в браузере: фото 900px, видео 360p ≤12 с, аудио mp3 ≤60 с."""
+    with LOCK:
+        items = STATE["items"]
+        if not 0 <= item_id < len(items):
+            raise HTTPException(404)
+        it = items[item_id]
+    src = Path(C.lp(it["src"]))
+    kind = it["kind"]
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        if kind in ("image", "graphics"):
+            out = CACHE_DIR / f"prev_{item_id}.jpg"
+            if not out.exists():
+                from PIL import Image
+                with Image.open(src) as im:
+                    im.thumbnail((900, 900))
+                    im.convert("RGB").save(out, "JPEG", quality=85)
+            return FileResponse(out)
+        if not C.HAS_FFMPEG:
+            raise HTTPException(503, "Нет ffmpeg")
+        d = C.duration_seconds(src) or 0.0
+        if kind == "footage":
+            out = CACHE_DIR / f"prev_{item_id}.mp4"
+            if not out.exists():
+                start = max(0.0, d * 0.3) if d > 15 else 0.0
+                r = C._run(["ffmpeg", "-v", "error", "-y", "-ss", f"{start:.2f}", "-i", str(src), "-t", "12",
+                            "-vf", "scale=-2:360", "-c:v", "libx264", "-preset", "veryfast", "-crf", "30",
+                            "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "96k", "-movflags", "+faststart", str(out)], 180)
+                if r.returncode != 0 or not out.exists():
+                    raise HTTPException(500, "Не удалось подготовить видео")
+            return FileResponse(out, media_type="video/mp4")
+        if kind in ("sfx", "music"):
+            out = CACHE_DIR / f"prev_{item_id}.mp3"
+            if not out.exists():
+                start = max(0.0, d * 0.3) if d > 70 else 0.0
+                r = C._run(["ffmpeg", "-v", "error", "-y", "-ss", f"{start:.2f}", "-i", str(src), "-t", "60",
+                            "-vn", "-ac", "2", "-b:a", "128k", str(out)], 120)
+                if r.returncode != 0 or not out.exists():
+                    raise HTTPException(500, "Не удалось подготовить звук")
+            return FileResponse(out, media_type="audio/mpeg")
+    except HTTPException:
+        raise
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(500, f"Предпросмотр не получился: {e}")
+    raise HTTPException(404)
+
+
+class LabelReq(BaseModel):
+    id: int
+    topic: str | None = None  # картинки/видео — тема; звуки — категория; музыка — настроение
+    tag: str | None = None  # звуки: имя звука
+    keep: bool = False  # «оставить как есть»
+    learn: bool = True
+
+
+@app.post("/api/label")
+def label(req: LabelReq):
+    with LOCK:
+        items = STATE["items"]
+        if STATE["phase"] != "ready" or not 0 <= req.id < len(items):
+            raise HTTPException(409, "Нечего менять")
+        it = items[req.id]
+        kind = it["kind"]
+        if req.keep:
+            it["review"] = False
+            return {"ok": True, "learned": False}
+        topic = _clean_dir(req.topic or "")
+        space, tag = None, None
+        if kind in ("image", "footage"):
+            if not topic:
+                raise HTTPException(400, "Укажи тему")
+            it["topic"], space = topic, "clip"
+        elif kind == "sfx":
+            tag = _slug(req.tag or "") or it.get("tag")
+            if not tag:
+                raise HTTPException(400, "Укажи имя звука")
+            topic = topic or it.get("topic") or C.UNKNOWN_SFX
+            it["topic"], it["tag"], space = topic, tag, "sfx"
+        elif kind == "music":
+            if not topic:
+                raise HTTPException(400, "Укажи настроение")
+            tag = _slug(req.tag or "") or next((m[1] for m in C.MOODS if m[0] == topic), _slug(topic))
+            it["topic"], it["tag"], space = topic, tag, "mood"
+        else:
+            raise HTTPException(400, "Этот тип не размечается")
+        it["target_dir"] = _target_dir(it)
+        it["review"] = False
+        it["learned"] = False
+        if STATE["rename"] and kind in ("sfx", "music") and it.get("tag"):
+            it["new_name"] = _name_for(it, items)
+        emb = it.get("emb")
+    learned = False
+    if req.learn and emb is not None and space:
+        M.add(space, emb, it["topic"], tag)
+        learned = True
+    return {"ok": True, "learned": learned, "dir": it["target_dir"], "new_name": it.get("new_name")}
+
 
 
 def _unique(dst: Path) -> Path:

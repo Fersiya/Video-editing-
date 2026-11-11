@@ -61,6 +61,25 @@ aside{display:flex;flex-direction:column;min-height:0;border-left:1px solid var(
 #menu .h{padding:6px 10px;color:var(--muted);font-size:12px}
 #menu button{display:block;width:100%;text-align:left;border:0;border-radius:6px;padding:6px 10px;background:none;font-size:13px}
 #menu button:hover{background:#2b2f4a}
+#cards .helpbar{grid-column:1/-1;display:flex;align-items:center;gap:10px;justify-content:space-between;background:linear-gradient(90deg,rgba(255,176,32,.14),rgba(255,92,138,.10));border:1px solid rgba(255,176,32,.5);border-radius:12px;padding:10px 12px}
+#rv{position:fixed;inset:0;z-index:30;background:rgba(6,7,10,.82);backdrop-filter:blur(6px);display:none;align-items:center;justify-content:center;padding:16px}
+#rv.on{display:flex}
+.rvbox{width:min(720px,100%);max-height:100%;overflow:auto;background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:16px;display:flex;flex-direction:column;gap:12px}
+.rvtop{display:flex;justify-content:space-between;align-items:center;color:var(--muted)}
+.rvbar{height:3px;background:var(--line);border-radius:3px;overflow:hidden}.rvbar i{display:block;height:100%;background:linear-gradient(90deg,var(--accent),var(--accent2));width:0;transition:width .2s}
+#rvmedia{min-height:200px;display:flex;align-items:center;justify-content:center;background:#0b0c11;border-radius:12px;overflow:hidden;position:relative}
+#rvmedia img,#rvmedia video{max-width:100%;max-height:340px;display:block}
+#rvmedia audio{width:92%}
+#rvmedia .ld{position:absolute;color:var(--muted)}
+#rvname{font-weight:600;word-break:break-all}
+#rvname small{display:block;color:var(--muted);font-weight:400}
+#rvguess{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:8px}
+#rvguess button{text-align:left;padding:10px 12px}
+#rvguess button b{color:var(--accent)}
+.rvcustom{display:flex;gap:8px;flex-wrap:wrap}
+.rvcustom input{flex:1;min-width:180px;background:var(--bg);border:1px solid var(--line);color:var(--text);padding:8px 10px;border-radius:8px;font:inherit}
+.rvfoot{display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap}
+.rvkeys{color:var(--muted);font-size:12px}
 select{font:inherit;color:var(--text);background:var(--card);border:1px solid var(--line);padding:8px 10px;border-radius:8px}
 #empty{grid-column:1/-1;color:var(--muted);text-align:center;padding:50px 20px}
 footer{display:flex;gap:10px;align-items:center;padding:10px 14px;border-top:1px solid var(--line);background:rgba(13,14,19,.7)}
@@ -79,6 +98,7 @@ footer .sum b{color:var(--text)}
   <label class="opt"><input type="checkbox" id="optContent" checked>По содержимому (ИИ)</label>
   <label class="opt"><input type="checkbox" id="optRename" checked>Переименовать звуки</label>
   <label class="opt"><input type="checkbox" id="optSplit" checked title="Вертикальные (9:16) и slow-mo (60+ fps) видео в отдельные подпапки">Вертикальные/slow-mo отдельно</label>
+  <label class="opt" title="Чем правее, тем чаще программа будет просить помощи, когда не уверена"><span>Строгость ИИ</span><input type="range" id="sens" min="50" max="150" value="100" style="width:80px"></label>
   <label class="opt"><input type="checkbox" id="optDups" checked>Дубликаты</label>
   <button class="primary" id="scan">Сканировать</button>
 </header>
@@ -105,6 +125,16 @@ footer .sum b{color:var(--text)}
 </footer>
 
 <canvas id="fx"></canvas>
+<div id="rv"><div class="rvbox">
+  <div class="rvtop"><span id="rvn"></span><button id="rvclose">Закрыть (Esc)</button></div>
+  <div class="rvbar"><i id="rvbar"></i></div>
+  <div id="rvmedia"></div>
+  <div id="rvname"></div>
+  <div id="rvguess"></div>
+  <div class="rvcustom"><input id="rvtxt" list="rvlist" placeholder="Свой вариант…" autocomplete="off"><select id="rvcat"></select><button class="primary" id="rvok">Готово</button></div>
+  <datalist id="rvlist"></datalist>
+  <div class="rvfoot"><span class="rvkeys">1–4 выбрать догадку · Пробел играть · → пропустить</span><span><button id="rvkeep">Оставить как есть</button> <button id="rvskip">Пропустить →</button></span></div>
+</div></div>
 <div id="menu"></div>
 <div id="toast"></div>
 
@@ -153,6 +183,12 @@ function buildCards(keep) {
   const box = $('#cards'); box.innerHTML = '';
   const byDir = {};
   for (const it of plan.items) (byDir[it.dir] ||= []).push(it);
+  if (plan.review_count) {
+    const hb = document.createElement('div'); hb.className = 'helpbar';
+    hb.innerHTML = `<span>🔍 Не уверена в <b>${plan.review_count}</b> ${pluralFiles(plan.review_count)}. Посмотри или послушай, и я запомню твои ответы.</span><button class="primary">Разобрать</button>`;
+    hb.querySelector('button').onclick = openReview;
+    box.appendChild(hb);
+  }
   for (const c of plan.cards) {
     const parts_ = c.dir.split('/'), title = parts_.pop(), parent = parts_.join('/');
     const el = document.createElement('div'); el.className = 'card';
@@ -168,7 +204,7 @@ function buildCards(keep) {
     el.querySelector('.ttl').textContent = ru(title);
     el.querySelector('.par').textContent = parent ? dirLabel(parent) : ' ';
     const files = el.querySelector('.files');
-    for (const i of items.slice(0, 60)) { const d = document.createElement('div'); d.textContent = i.name + (i.new_name ? '  →  ' + i.new_name : '') + (i.bpm ? '  (~' + i.bpm + ' bpm)' : '') + (i.dup_of ? '  ⟵ копия ' + i.dup_of : ''); if (i.dup_of) d.className = 'd'; if (EDITABLE.has(i.kind)) { d.classList.add('ed'); d.title = 'Нажми, чтобы перенести в другую папку'; d.onclick = e => openMenu(e, i); } files.appendChild(d); }
+    for (const i of items.slice(0, 60)) { const d = document.createElement('div'); d.textContent = i.name + (i.new_name ? '  →  ' + i.new_name : '') + (i.bpm ? '  (~' + i.bpm + ' bpm)' : '') + (i.dup_of ? '  ⟵ копия ' + i.dup_of : '') + (i.learned ? '  ★' : '') + (i.review ? '  ?' : ''); if (i.dup_of) d.className = 'd'; if (EDITABLE.has(i.kind)) { d.classList.add('ed'); d.title = 'Нажми, чтобы перенести в другую папку'; d.onclick = e => openMenu(e, i); } files.appendChild(d); }
     if (items.length > 60) { const d = document.createElement('div'); d.textContent = `… и ещё ${items.length - 60}`; files.appendChild(d); }
     const cb = el.querySelector('input');
     cb.onchange = () => { c.on = cb.checked; el.classList.toggle('off', !cb.checked); updateSummary(); };
@@ -384,7 +420,7 @@ $('#scan').onclick = async () => {
   const path = $('#path').value.trim();
   if (!path) return toast('Укажи папку');
   clearCards();
-  try { await api('/api/scan', {method: 'POST', body: JSON.stringify({path, content: $('#optContent').checked, dups: $('#optDups').checked, rename: $('#optRename').checked, split_video: $('#optSplit').checked})}); }
+  try { await api('/api/scan', {method: 'POST', body: JSON.stringify({path, content: $('#optContent').checked, dups: $('#optDups').checked, rename: $('#optRename').checked, split_video: $('#optSplit').checked, help_sens: $('#sens').value / 100})}); }
   catch (e) { return toast(e.message); }
   localStorage.setItem?.('ms_path', path);
   setPhase('scanning'); ensureParticles(160); speed = 0.35; setStatus('Сканирую…', '', 0); poll();
@@ -413,6 +449,81 @@ $('#undo').onclick = async () => {
   poll2();
 };
 async function poll2() { try { const s = await api('/api/state'); $('#undo').disabled = !s.can_undo; } catch {} }
+
+/* ---------- «Нужна помощь»: разбор неуверенных файлов ---------- */
+let rv = {items: [], i: 0, data: null, done: 0};
+async function openReview() {
+  try { rv.data = await api('/api/review'); } catch (e) { return toast(e.message); }
+  rv.items = rv.data.items; rv.i = 0; rv.done = 0;
+  if (!rv.items.length) return toast('Нечего разбирать');
+  $('#rv').classList.add('on'); showReview();
+}
+function closeReview() {
+  $('#rv').classList.remove('on'); $('#rvmedia').innerHTML = '';
+  refreshPlan().then(() => { if (rv.done) toast(`Разобрано: ${rv.done}`); });
+}
+function showReview() {
+  if (rv.i >= rv.items.length) return closeReview();
+  const it = rv.items[rv.i];
+  $('#rvn').textContent = `Файл ${rv.i + 1} из ${rv.items.length}`;
+  $('#rvbar').style.width = Math.round(rv.i / rv.items.length * 100) + '%';
+  const nm = $('#rvname'); nm.textContent = it.name; const sm = document.createElement('small');
+  sm.textContent = (it.topic ? 'Сейчас: ' + (it.tag ? it.tag + ' · ' : '') + it.topic : 'Сейчас: не определено') + (it.conf != null ? `  ·  уверенность ${Math.round(it.conf * 100)}%` : '');
+  nm.appendChild(sm);
+  // медиа
+  const box = $('#rvmedia'); box.innerHTML = '<span class="ld">Готовлю предпросмотр…</span>';
+  const src = '/api/preview/' + it.id; let el;
+  if (it.kind === 'sfx' || it.kind === 'music') { el = document.createElement('audio'); el.controls = true; el.autoplay = true; }
+  else if (it.kind === 'footage') { el = document.createElement('video'); el.controls = true; el.autoplay = true; el.loop = true; el.muted = false; if (it.thumb) el.poster = '/api/thumb/' + it.id; }
+  else { el = document.createElement('img'); }
+  const ready = () => box.querySelector('.ld')?.remove();
+  el.addEventListener('loadeddata', ready); el.addEventListener('load', ready);
+  el.addEventListener('error', () => { const l = box.querySelector('.ld'); if (l) l.textContent = 'Не удалось показать предпросмотр'; });
+  el.src = src; box.appendChild(el);
+  // догадки
+  const g = $('#rvguess'); g.innerHTML = '';
+  it.guesses.slice(0, 4).forEach((x, k) => {
+    const b = document.createElement('button'); b.innerHTML = `<b>${k + 1}</b>  ${x.label} · ${Math.round(x.p * 100)}%`;
+    b.onclick = () => answer(it, x.cat, x.tag); g.appendChild(b);
+  });
+  // своё
+  const txt = $('#rvtxt'), cat = $('#rvcat'), dl = $('#rvlist'); txt.value = ''; dl.innerHTML = ''; cat.innerHTML = '';
+  if (it.kind === 'sfx') {
+    txt.placeholder = 'Имя звука, например: door slam'; cat.style.display = '';
+    for (const c of rv.data.sfx_cats.concat(['Разное'])) { const o = document.createElement('option'); o.textContent = c; cat.appendChild(o); }
+    cat.value = it.topic && rv.data.sfx_cats.includes(it.topic) ? it.topic : (it.guesses[0]?.cat || 'Разное');
+  } else {
+    cat.style.display = 'none';
+    txt.placeholder = it.kind === 'music' ? 'Своё настроение…' : 'Своя папка (тема)…';
+    for (const t of (it.kind === 'music' ? rv.data.moods : rv.data.topics)) { const o = document.createElement('option'); o.value = t; dl.appendChild(o); }
+  }
+  setTimeout(() => txt.blur(), 0);
+}
+async function answer(it, topic, tag, keep) {
+  try {
+    const r = await api('/api/label', {method: 'POST', body: JSON.stringify({id: it.id, topic, tag, keep: !!keep})});
+    rv.done++; if (r.learned) $('#rvn').textContent += '  ·  запомнила';
+  } catch (e) { return toast(e.message); }
+  rv.i++; showReview();
+}
+$('#rvok').onclick = () => {
+  const it = rv.items[rv.i], v = $('#rvtxt').value.trim();
+  if (it.kind === 'sfx') { if (!v) return toast('Впиши имя звука или выбери догадку'); answer(it, $('#rvcat').value, v); }
+  else { if (!v) return toast('Впиши название или выбери догадку'); answer(it, v, null); }
+};
+$('#rvkeep').onclick = () => answer(rv.items[rv.i], null, null, true);
+$('#rvskip').onclick = () => { rv.i++; showReview(); };
+$('#rvclose').onclick = closeReview;
+$('#rvtxt').addEventListener('keydown', e => { if (e.key === 'Enter') $('#rvok').click(); });
+addEventListener('keydown', e => {
+  if (!$('#rv').classList.contains('on')) return;
+  if (e.key === 'Escape') return closeReview();
+  if (e.target.matches('input,select')) return;
+  const it = rv.items[rv.i]; if (!it) return;
+  if (/^[1-4]$/.test(e.key)) { const x = it.guesses[+e.key - 1]; if (x) answer(it, x.cat, x.tag); }
+  else if (e.key === ' ') { e.preventDefault(); const m = $('#rvmedia').querySelector('audio,video'); if (m) m.paused ? m.play() : m.pause(); }
+  else if (e.key === 'ArrowRight') $('#rvskip').click();
+});
 
 $('#path').addEventListener('keydown', e => { if (e.key === 'Enter') $('#scan').click(); });
 try { const p = localStorage.getItem('ms_path'); if (p) $('#path').value = p; } catch {}

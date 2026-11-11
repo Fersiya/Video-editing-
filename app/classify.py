@@ -322,10 +322,11 @@ class Clip:
             self.error = f"не удалось загрузить модель: {e}"
             return False
 
-    def classify(self, groups: list[list[Path]]) -> list[str]:
-        """groups[i] — один или несколько кадров одного файла; эмбеддинги усредняются."""
+    def classify(self, groups: list[list[Path]]) -> list[dict]:
+        """groups[i] — один или несколько кадров одного файла; эмбеддинги усредняются.
+        Возвращает по файлу: topic, conf, top (4 лучших догадки), emb (отпечаток для памяти)."""
         torch = self._torch
-        out: list[str] = []
+        out: list[dict] = []
         B = 16
         for i in range(0, len(groups), B):
             batch = groups[i:i + B]
@@ -338,7 +339,7 @@ class Clip:
                         owner.append(gi)
                     except Exception:
                         pass
-            res = [UNKNOWN_TOPIC] * len(batch)
+            res = [{"topic": UNKNOWN_TOPIC, "conf": 0.0, "top": [], "emb": None} for _ in batch]
             if imgs:
                 with torch.no_grad():
                     inp = self._proc(images=imgs, return_tensors="pt").to(self.device)
@@ -352,8 +353,13 @@ class Clip:
                         m = m / m.norm()
                         probs = (100.0 * m @ self._text.T).softmax(dim=-1)
                         conf, arg = probs.max(dim=-1)
-                        if conf.item() >= MIN_CONFIDENCE:
-                            res[gi] = self._names[arg.item()]
+                        vals, idx = probs.topk(min(4, len(self._names)))
+                        res[gi] = {
+                            "topic": self._names[arg.item()] if conf.item() >= MIN_CONFIDENCE else UNKNOWN_TOPIC,
+                            "conf": float(conf.item()),
+                            "top": [(self._names[j], float(v)) for v, j in zip(vals.tolist(), idx.tolist())],
+                            "emb": [round(x, 4) for x in m.tolist()],
+                        }
             out.extend(res)
         return out
 
@@ -575,7 +581,12 @@ class AudioClap:
                 k = amb[int(probs[r, amb].argmax())]
                 cat, tag, _ = SFX_TAGS[int(si)]
                 mcat, mtag, _ = MOODS[int(mi)]
+                sv, si_ = sfx_p[r].topk(4)
+                mv, mi_ = mood_p[r].topk(4)
                 out.append({
+                    "emb": [round(x, 4) for x in f[r].tolist()],
+                    "sfx_top": [(SFX_TAGS[j][0], SFX_TAGS[j][1], float(v)) for v, j in zip(sv.tolist(), si_.tolist())],
+                    "mood_top": [(MOODS[j][0], MOODS[j][1], float(v)) for v, j in zip(mv.tolist(), mi_.tolist())],
                     "p_music": float(probs[r, n_sfx:].sum()),
                     "p_amb": float(probs[r, amb].sum()),
                     "sfx": (cat, tag, float(sc)) if float(sc) >= SFX_MIN_CONF else (UNKNOWN_SFX, None, float(sc)),
